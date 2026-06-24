@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; img-src 'self' file: data:; media-src 'self' file: data:; style-src 'self' 'unsafe-inline';" />
+  <title>Quick Trim</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- Drop zone (initial state) -->
+  <div id="dropzone" class="dropzone">
+    <div class="drop-inner">
+      <div class="drop-icon">🎬</div>
+      <div class="drop-title">拖拽视频到此处</div>
+      <div class="drop-sub">或 <button id="open-btn" class="link-btn">点击打开</button></div>
+    </div>
+  </div>
+
+  <!-- Editor (shown after a video is loaded) -->
+  <div id="editor" class="editor hidden">
+    <header class="topbar" id="topbar">
+      <div class="title-wrap">
+        <button id="close-btn" class="icon-btn" title="关闭">✕</button>
+        <span id="filename" class="filename">—</span>
+      </div>
+      <button id="done-btn" class="done-btn">完成</button>
+    </header>
+
+    <main class="stage">
+      <video id="video" playsinline></video>
+      <div id="preview-fallback" class="preview-fallback hidden">
+        <div class="pf-icon">⚠️</div>
+        <div class="pf-title">此视频编码无法在本机预览</div>
+        <div class="pf-sub">常见于 HEVC / HDR。仍可正常裁剪与导出——无损模式无需解码。</div>
+      </div>
+    </main>
+
+    <footer class="controls">
+      <div class="controls-row">
+        <button id="play-btn" class="play-btn" title="播放/暂停">▶</button>
+
+        <div class="track-wrap">
+          <div id="track" class="track">
+            <div id="filmstrip" class="filmstrip"></div>
+            <div id="dim-left" class="dim"></div>
+            <div id="dim-right" class="dim"></div>
+            <div id="sel" class="selection">
+              <div id="handle-start" class="handle handle-start" data-which="start"></div>
+              <div id="handle-end" class="handle handle-end" data-which="end"></div>
+            </div>
+            <div id="playhead" class="playhead"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="meta-row">
+        <div class="time-group">
+          <label>起点</label>
+          <input id="start-input" class="time-input" value="00:00:00.000" />
+        </div>
+        <div class="time-group">
+          <label>终点</label>
+          <input id="end-input" class="time-input" value="00:00:00.000" />
+        </div>
+        <div class="time-group">
+          <label>时长</label>
+          <span id="dur-label" class="dur-label">00:00:00.000</span>
+        </div>
+        <div class="spacer"></div>
+        <label class="precise-toggle" title="勾选后重新编码，达到帧精确（较慢，轻微画质损失）">
+          <input type="checkbox" id="precise-check" />
+          精确模式
+        </label>
+      </div>
+      <div id="hint" class="hint">无损模式下起点会自动吸附到最近的关键帧，可能与所选位置相差几帧。</div>
+    </footer>
+  </div>
+
+  <!-- Export overlay -->
+  <div id="overlay" class="overlay hidden">
+    <div class="overlay-box">
+      <div id="overlay-msg" class="overlay-msg">正在导出…</div>
+      <div class="progress"><div id="progress-bar" class="progress-bar"></div></div>
+      <div id="progress-pct" class="progress-pct">0%</div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>
