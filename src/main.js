@@ -102,6 +102,7 @@ function createWindow() {
 
 app.whenReady().then(() => {
   checkBinaries();
+  detectHwEncoders(); // warm the cache so the re-encode modal is instant
   createWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -197,38 +198,195 @@ ipcMain.handle('thumbnails', async (_evt, { filePath, count = 10, durationSec = 
 // ---- IPC: export ------------------------------------------------------------
 
 // H.264 + AAC fit these containers; anything else gets remuxed to .mp4 in
-// precise mode (see exportClip).
+// precise mode.
 const MP4_LIKE = /\.(mp4|mov|m4v|mkv|ts)$/i;
+const MP4_OR_MOV = /\.(mp4|mov|m4v)$/i;
+const HW_SUFFIXES = ['_videotoolbox', '_nvenc', '_qsv', '_amf'];
+const isHwEncoder = (c) => HW_SUFFIXES.some((s) => c.endsWith(s));
+const isHevcEncoder = (c) => c === 'libx265' || /^hevc_/.test(c);
 
-function buildExportArgs({ filePath, start, end, mode, outPath }) {
-  const ss = hmsToSeconds(start);
-  const dur = Math.max(0.001, hmsToSeconds(end) - ss);
-  if (mode === 'precise') {
-    // Frame-accurate: re-encode the selection to H.264/AAC.
-    const args = [
-      '-ss', String(ss),
-      '-i', filePath,
-      '-t', String(dur),
-      '-c:v', 'libx264', '-crf', '18', '-preset', 'veryfast',
-      '-c:a', 'aac', '-b:a', '192k'
-    ];
-    // +faststart is only meaningful for mp4/mov/m4v.
-    if (/\.(mp4|mov|m4v)$/i.test(outPath)) args.push('-movflags', '+faststart');
-    args.push('-y', outPath);
-    return args;
+// ---- hardware encoder detection --------------------------------------------
+
+// Candidate hardware encoders per platform. macOS → VideoToolbox; Windows →
+// NVIDIA/Intel/AMD; Linux → NVIDIA/Intel. We only advertise the ones that
+// actually work on this machine (probed below).
+function hwCandidates() {
+  switch (process.platform) {
+    case 'darwin':
+      return [
+        { id: 'h264_videotoolbox', codec: 'h264', label: 'H.264 硬件加速 (VideoToolbox)' },
+        { id: 'hevc_videotoolbox', codec: 'hevc', label: 'H.265 硬件加速 (VideoToolbox)' }
+      ];
+    case 'win32':
+      return [
+        { id: 'hevc_nvenc', codec: 'hevc', label: 'H.265 硬件加速 (NVIDIA NVENC)' },
+        { id: 'h264_nvenc', codec: 'h264', label: 'H.264 硬件加速 (NVIDIA NVENC)' },
+        { id: 'hevc_qsv', codec: 'hevc', label: 'H.265 硬件加速 (Intel QSV)' },
+        { id: 'h264_qsv', codec: 'h264', label: 'H.264 硬件加速 (Intel QSV)' },
+        { id: 'hevc_amf', codec: 'hevc', label: 'H.265 硬件加速 (AMD AMF)' },
+        { id: 'h264_amf', codec: 'h264', label: 'H.264 硬件加速 (AMD AMF)' }
+      ];
+    case 'linux':
+      return [
+        { id: 'hevc_nvenc', codec: 'hevc', label: 'H.265 硬件加速 (NVIDIA NVENC)' },
+        { id: 'h264_nvenc', codec: 'h264', label: 'H.264 硬件加速 (NVIDIA NVENC)' },
+        { id: 'hevc_qsv', codec: 'hevc', label: 'H.265 硬件加速 (Intel QSV)' },
+        { id: 'h264_qsv', codec: 'h264', label: 'H.264 硬件加速 (Intel QSV)' }
+      ];
+    default:
+      return [];
   }
-  // Lossless stream copy (keyframe-aligned start). Map only video/audio/subtitle
-  // streams with '?' so optional ones are skipped and problematic data /
-  // timecode / attachment streams don't abort the remux.
-  return [
-    '-ss', String(ss),
-    '-i', filePath,
-    '-t', String(dur),
-    '-map', '0:v?', '-map', '0:a?', '-map', '0:s?',
-    '-c', 'copy',
-    '-avoid_negative_ts', 'make_zero',
-    '-y', outPath
-  ];
+}
+
+// An encoder "works" if it can encode a few synthetic frames without error —
+// this proves both the build support and the presence of the GPU/driver.
+function encoderWorks(encoder) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (ok) => { if (!done) { done = true; resolve(ok); } };
+    let child;
+    try {
+      child = spawn(ffmpegPath, [
+        '-hide_banner', '-loglevel', 'error',
+        '-f', 'lavfi', '-i', 'color=c=black:s=256x256:r=5:d=0.2',
+        '-frames:v', '3', '-c:v', encoder, '-f', 'null', '-'
+      ]);
+    } catch (_) { return finish(false); }
+    const t = setTimeout(() => { try { child.kill('SIGKILL'); } catch (_) {} finish(false); }, 12000);
+    child.on('error', () => { clearTimeout(t); finish(false); });
+    child.on('close', (code) => { clearTimeout(t); finish(code === 0); });
+  });
+}
+
+let _hwPromise = null;
+function detectHwEncoders() {
+  if (!_hwPromise) {
+    _hwPromise = Promise.all(hwCandidates().map((c) => encoderWorks(c.id).then((ok) => (ok ? c : null))))
+      .then((list) => {
+        const ok = list.filter(Boolean);
+        if (!app.isPackaged) console.log('[hw] available encoders:', ok.map((c) => c.id).join(', ') || '(none)');
+        return ok;
+      })
+      .catch(() => []);
+  }
+  return _hwPromise;
+}
+
+ipcMain.handle('hwEncoders', () => detectHwEncoders());
+
+// Output file extension for a given export descriptor.
+function outputExtFor(opts) {
+  const srcExt = path.extname(opts.filePath);
+  switch (opts.kind) {
+    case 'frame': return '.' + (opts.frameFormat || 'png');
+    case 'audio': return { mp3: '.mp3', m4a: '.m4a', aac: '.m4a', wav: '.wav', flac: '.flac' }[opts.audioFormat || 'mp3'];
+    case 'gif': return '.gif';
+    case 'reencode': return '.' + (opts.container || 'mp4');
+    case 'precise': return MP4_LIKE.test(srcExt) ? srcExt : '.mp4';
+    case 'stripAudio':
+    case 'lossless':
+    default: return srcExt;
+  }
+}
+
+// Default filename suffix for "save as".
+function suffixFor(kind) {
+  return { frame: '_frame', audio: '_audio', gif: '', stripAudio: '_noaudio' }[kind] ?? '_trimmed';
+}
+
+// Build the ffmpeg argument list for a given export descriptor + output path.
+function buildArgs(opts, outPath) {
+  const ss = hmsToSeconds(opts.start);
+  const dur = Math.max(0.001, hmsToSeconds(opts.end) - ss);
+  const inSeek = ['-ss', String(ss), '-i', opts.filePath, '-t', String(dur)];
+  const faststart = () => (MP4_OR_MOV.test(outPath) ? ['-movflags', '+faststart'] : []);
+
+  switch (opts.kind) {
+    case 'frame': {
+      // A single still from the current playhead position.
+      const t = hmsToSeconds(opts.frameTime != null ? opts.frameTime : ss);
+      const q = /\.png$/i.test(outPath) ? [] : ['-q:v', '2'];
+      return ['-ss', String(t), '-i', opts.filePath, '-frames:v', '1', ...q, '-y', outPath];
+    }
+
+    case 'audio': {
+      const abr = opts.audioBitrate || '192k';
+      const enc = {
+        mp3: ['-c:a', 'libmp3lame', '-b:a', abr],
+        m4a: ['-c:a', 'aac', '-b:a', abr],
+        aac: ['-c:a', 'aac', '-b:a', abr],
+        wav: ['-c:a', 'pcm_s16le'],
+        flac: ['-c:a', 'flac']
+      }[opts.audioFormat || 'mp3'] || ['-c:a', 'libmp3lame', '-b:a', abr];
+      return [...inSeek, '-vn', ...enc, '-y', outPath];
+    }
+
+    case 'gif': {
+      const fps = opts.gifFps || 15;
+      const scale = opts.gifWidth ? `,scale=${opts.gifWidth}:-1:flags=lanczos` : '';
+      // One-pass high-quality GIF: build an optimal palette, then apply it.
+      const fc = `[0:v]fps=${fps}${scale},split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=5`;
+      return [...inSeek, '-filter_complex', fc, '-y', outPath];
+    }
+
+    case 'stripAudio':
+      return [...inSeek, '-map', '0:v?', '-map', '0:s?', '-c', 'copy', '-an',
+        '-avoid_negative_ts', 'make_zero', '-y', outPath];
+
+    case 'precise': {
+      // Frame-accurate: re-encode the selection to H.264/AAC.
+      return [...inSeek, '-c:v', 'libx264', '-crf', '18', '-preset', 'veryfast',
+        '-c:a', 'aac', '-b:a', '192k', ...faststart(), '-y', outPath];
+    }
+
+    case 'reencode': {
+      const v = opts.video || {};
+      const a = opts.audio || {};
+      const container = opts.container || 'mp4';
+      const args = [...inSeek];
+
+      // Video filters (scale / fps) only apply when actually re-encoding.
+      const vf = [];
+      if (v.fps) vf.push(`fps=${v.fps}`);
+      if (v.scaleH) vf.push(`scale=-2:${v.scaleH}`);
+
+      if (v.codec === 'copy') {
+        args.push('-c:v', 'copy'); // filters not possible with stream copy
+      } else {
+        if (vf.length) args.push('-vf', vf.join(','));
+        const codec = v.codec || 'libx264';
+        args.push('-c:v', codec);
+        if (isHwEncoder(codec)) {
+          args.push('-b:v', v.bitrate || '8M'); // hardware encoders are bitrate-driven
+        } else if (codec === 'libvpx-vp9') {
+          args.push('-b:v', '0', '-crf', String(v.crf != null ? v.crf : 31));
+        } else { // libx264 / libx265
+          args.push('-crf', String(v.crf != null ? v.crf : 23), '-preset', v.preset || 'medium');
+        }
+        // QuickTime needs the hvc1 tag to recognise HEVC in mp4/mov.
+        if (isHevcEncoder(codec) && MP4_OR_MOV.test(outPath)) args.push('-tag:v', 'hvc1');
+      }
+
+      // Audio
+      if (a.mode === 'remove') {
+        args.push('-an');
+      } else if (a.mode === 'copy') {
+        args.push('-c:a', 'copy');
+      } else {
+        // WebM only takes Opus/Vorbis; everything else gets AAC.
+        args.push('-c:a', container === 'webm' ? 'libopus' : 'aac', '-b:a', a.bitrate || '192k');
+      }
+
+      return [...args, ...faststart(), '-y', outPath];
+    }
+
+    case 'lossless':
+    default:
+      // Lossless stream copy (keyframe-aligned start). Map only v/a/s with '?'
+      // so problematic data/timecode/attachment streams don't abort the remux.
+      return [...inSeek, '-map', '0:v?', '-map', '0:a?', '-map', '0:s?',
+        '-c', 'copy', '-avoid_negative_ts', 'make_zero', '-y', outPath];
+  }
 }
 
 function runFfmpegWithProgress(args, totalDur, evt) {
@@ -282,28 +440,32 @@ function moveInto(tmpPath, finalPath) {
 }
 
 ipcMain.handle('exportClip', async (evt, opts) => {
-  const { filePath, start, end, mode, target } = opts;
-  const totalDur = hmsToSeconds(end) - hmsToSeconds(start);
-  if (!(totalDur > 0)) throw new Error('选区无效：终点必须晚于起点。');
+  const { filePath, kind = 'lossless' } = opts;
+  const totalDur = hmsToSeconds(opts.end) - hmsToSeconds(opts.start);
+  // Frame grab ignores the selection length; everything else needs a real range.
+  if (kind !== 'frame' && !(totalDur > 0)) throw new Error('选区无效：终点必须晚于起点。');
 
   const srcExt = path.extname(filePath);
   const dir = path.dirname(filePath);
   const base = path.basename(filePath, srcExt);
-  // Precise mode re-encodes to H.264/AAC, which only fits mp4-like containers.
-  // For other containers we remux the output to .mp4 so it stays valid.
-  const outExt = (mode === 'precise' && !MP4_LIKE.test(srcExt)) ? '.mp4' : srcExt;
+  const outExt = outputExtFor(opts);
+
+  // Frame / audio / GIF produce inherently new files — replacing the source
+  // makes no sense, so force "save as" for those.
+  let target = opts.target;
+  if (kind === 'frame' || kind === 'audio' || kind === 'gif') target = 'saveAs';
 
   let finalPath;
   if (target === 'saveAs') {
     const res = await dialog.showSaveDialog(mainWindow, {
-      title: '另存为',
-      defaultPath: path.join(dir, `${base}_trimmed${outExt}`),
-      filters: [{ name: 'Video', extensions: [outExt.replace('.', '') || 'mp4'] }]
+      title: '导出',
+      defaultPath: path.join(dir, `${base}${suffixFor(kind)}${outExt}`),
+      filters: [{ name: '文件', extensions: [outExt.replace('.', '') || 'mp4'] }]
     });
     if (res.canceled || !res.filePath) return { canceled: true };
     finalPath = res.filePath;
   } else if (target === 'replace') {
-    // If precise mode changed the container, the result must carry the new
+    // If the operation changed the container, the result carries the new
     // extension; the original (different extension) is removed after success.
     finalPath = path.join(dir, base + outExt);
   } else {
@@ -312,12 +474,15 @@ ipcMain.handle('exportClip', async (evt, opts) => {
 
   // Write to a temp file first (keeps the original safe if ffmpeg fails, and is
   // required for in-place replace since ffmpeg can't read+overwrite one file).
+  // Put the temp on the destination volume so the final move is an atomic rename.
   const rnd = crypto.randomBytes(6).toString('hex');
-  const tmpPath = path.join(dir, `.${base}_qt_tmp_${process.pid}_${rnd}${outExt}`);
-  const args = buildExportArgs({ filePath, start, end, mode, outPath: tmpPath });
+  const tmpDir = target === 'saveAs' ? path.dirname(finalPath) : dir;
+  const tmpName = path.basename(finalPath, outExt);
+  const tmpPath = path.join(tmpDir, `.${tmpName}_qt_tmp_${process.pid}_${rnd}${outExt}`);
+  const args = buildArgs(opts, tmpPath);
 
   try {
-    await runFfmpegWithProgress(args, totalDur, evt);
+    await runFfmpegWithProgress(args, kind === 'frame' ? 0 : totalDur, evt);
     moveInto(tmpPath, finalPath);
     // Replacing with a changed container: drop the now-stale original.
     if (target === 'replace' && path.resolve(finalPath) !== path.resolve(filePath)) {

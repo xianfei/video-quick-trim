@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld('api', {
   getPathForFile: (file) => webUtils.getPathForFile(file),
 
   probe: (filePath) => ipcRenderer.invoke('probe', filePath),
+  hwEncoders: () => ipcRenderer.invoke('hwEncoders'),
   thumbnails: (opts) => ipcRenderer.invoke('thumbnails', opts),
   exportClip: (opts) => ipcRenderer.invoke('exportClip', opts),
   openDialog: () => ipcRenderer.invoke('openDialog'),

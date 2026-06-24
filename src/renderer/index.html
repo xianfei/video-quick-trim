@@ -11,6 +11,7 @@
 <body>
   <!-- Drop zone (initial state) -->
   <div id="dropzone" class="dropzone">
+    <div class="drag-strip"></div>
     <div class="drop-inner">
       <div class="drop-icon">🎬</div>
       <div class="drop-title">拖拽视频到此处</div>
@@ -25,8 +26,21 @@
         <button id="close-btn" class="icon-btn" title="关闭">✕</button>
         <span id="filename" class="filename">—</span>
       </div>
-      <button id="done-btn" class="done-btn">完成</button>
+      <div class="topbar-actions">
+        <button id="adv-btn" class="adv-btn" title="高级导出">⋯</button>
+        <button id="done-btn" class="done-btn">完成</button>
+      </div>
     </header>
+
+    <!-- Advanced export dropdown -->
+    <div id="adv-menu" class="adv-menu hidden">
+      <button class="adv-item" data-act="reencode">重编码导出…</button>
+      <button class="adv-item" data-act="audio">仅导出音频…</button>
+      <button class="adv-item" data-act="gif">转为 GIF…</button>
+      <div class="adv-sep"></div>
+      <button class="adv-item" data-act="stripAudio">移除音频（无损）</button>
+      <button class="adv-item" data-act="frame">导出当前帧为图片</button>
+    </div>
 
     <main class="stage">
       <video id="video" playsinline></video>
@@ -69,13 +83,137 @@
           <span id="dur-label" class="dur-label">00:00:00.000</span>
         </div>
         <div class="spacer"></div>
-        <label class="precise-toggle" title="勾选后重新编码，达到帧精确（较慢，轻微画质损失）">
+        <label class="precise-toggle">
           <input type="checkbox" id="precise-check" />
           精确模式
         </label>
+        <span class="help" tabindex="0" aria-label="说明">?
+          <span class="help-tip">无损模式（默认）用流复制，起点会自动吸附到最近的关键帧，可能与所选位置相差几帧，但画质零损失、速度极快。<br><br>勾选「精确模式」会重新编码以实现帧精确切割，速度较慢且有轻微画质损失。</span>
+        </span>
       </div>
-      <div id="hint" class="hint">无损模式下起点会自动吸附到最近的关键帧，可能与所选位置相差几帧。</div>
     </footer>
+  </div>
+
+  <!-- Re-encode settings modal -->
+  <div id="reencode-modal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-title">重编码导出</div>
+      <div class="preset-row">
+        <button class="preset" data-preset="h264">高质量 H.264</button>
+        <button class="preset" data-preset="h265">高压缩 H.265</button>
+        <button class="preset" data-preset="vt">硬件加速</button>
+        <button class="preset" data-preset="web">网页 WebM</button>
+      </div>
+      <div class="form-grid">
+        <label>视频编码</label>
+        <select id="re-vcodec">
+          <option value="libx264">H.264 (libx264)</option>
+          <option value="libx265">H.265 (libx265)</option>
+          <!-- 可用的硬件编码器在运行时按平台自动注入到这里 -->
+          <option value="libvpx-vp9">VP9 (libvpx-vp9)</option>
+          <option value="copy">不重编码视频（仅改封装 / 音频）</option>
+        </select>
+
+        <label id="re-crf-label">质量 (CRF，越小越好)</label>
+        <div class="quality-wrap" id="re-crf-wrap">
+          <input type="range" id="re-crf" min="0" max="51" value="23" />
+          <span id="re-crf-val">23</span>
+        </div>
+
+        <label id="re-bitrate-label" class="hidden">码率</label>
+        <input id="re-bitrate" class="text-input hidden" value="8M" />
+
+        <label>分辨率</label>
+        <select id="re-res">
+          <option value="">保持原始</option>
+          <option value="2160">2160p (4K)</option>
+          <option value="1440">1440p (2K)</option>
+          <option value="1080">1080p</option>
+          <option value="720">720p</option>
+          <option value="480">480p</option>
+        </select>
+
+        <label>帧率</label>
+        <select id="re-fps">
+          <option value="">保持原始</option>
+          <option value="60">60 fps</option>
+          <option value="30">30 fps</option>
+          <option value="24">24 fps</option>
+        </select>
+
+        <label>音频</label>
+        <select id="re-audio">
+          <option value="copy">保留原音轨</option>
+          <option value="aac">重新编码</option>
+          <option value="remove">移除音频</option>
+        </select>
+
+        <label>封装格式</label>
+        <select id="re-container">
+          <option value="mp4">MP4</option>
+          <option value="mkv">MKV</option>
+          <option value="mov">MOV</option>
+          <option value="webm">WebM</option>
+        </select>
+      </div>
+      <div class="modal-actions">
+        <button class="btn-secondary" data-close>取消</button>
+        <button id="re-export" class="btn-primary">导出…</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Audio-only modal -->
+  <div id="audio-modal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-title">仅导出音频</div>
+      <div class="form-grid">
+        <label>格式</label>
+        <select id="au-format">
+          <option value="mp3">MP3</option>
+          <option value="m4a">AAC (m4a)</option>
+          <option value="wav">WAV（无损）</option>
+          <option value="flac">FLAC（无损）</option>
+        </select>
+        <label id="au-bitrate-label">码率</label>
+        <select id="au-bitrate">
+          <option value="320k">320 kbps</option>
+          <option value="256k">256 kbps</option>
+          <option value="192k" selected>192 kbps</option>
+          <option value="128k">128 kbps</option>
+        </select>
+      </div>
+      <div class="modal-actions">
+        <button class="btn-secondary" data-close>取消</button>
+        <button id="au-export" class="btn-primary">导出…</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- GIF modal -->
+  <div id="gif-modal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-title">转为 GIF</div>
+      <div class="form-grid">
+        <label>帧率</label>
+        <select id="gif-fps">
+          <option value="10">10 fps</option>
+          <option value="15" selected>15 fps</option>
+          <option value="24">24 fps</option>
+        </select>
+        <label>宽度</label>
+        <select id="gif-width">
+          <option value="">保持原始</option>
+          <option value="640">640 px</option>
+          <option value="480" selected>480 px</option>
+          <option value="320">320 px</option>
+        </select>
+      </div>
+      <div class="modal-actions">
+        <button class="btn-secondary" data-close>取消</button>
+        <button id="gif-export" class="btn-primary">导出…</button>
+      </div>
+    </div>
   </div>
 
   <!-- Export overlay -->

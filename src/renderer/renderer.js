@@ -254,6 +254,9 @@ window.addEventListener('keydown', (e) => {
   const typing = document.activeElement === startInput || document.activeElement === endInput;
   if (typing) return;
   if (editor.classList.contains('hidden')) return;
+  // When a settings dialog is open, only Escape (to close it) is handled.
+  const openModalEl = document.querySelector('.modal:not(.hidden)');
+  if (openModalEl) { if (e.key === 'Escape') closeModal(openModalEl); return; }
   if (e.key === ' ') { e.preventDefault(); togglePlay(); }
   else if (e.key === 'ArrowLeft') { e.preventDefault(); video.currentTime = Math.max(0, video.currentTime - (e.shiftKey ? 1 : 0.1)); updatePlayhead(); }
   else if (e.key === 'ArrowRight') { e.preventDefault(); video.currentTime = Math.min(duration, video.currentTime + (e.shiftKey ? 1 : 0.1)); updatePlayhead(); }
@@ -301,37 +304,199 @@ document.body.addEventListener('drop', (e) => {
 if (window.api.onOpenFile) window.api.onOpenFile((p) => { if (p) loadVideo(p); });
 
 // ---------- export ----------
-$('done-btn').addEventListener('click', async () => {
+// Single entry point for every export kind. opts.filePath/start/end are filled
+// from current state; needChoice asks replace-vs-saveAs first.
+async function performExport(opts, { needChoice = false, msg = '正在导出…' } = {}) {
   if (!filePath) return;
-  const choice = await window.api.saveChoice();
-  if (choice === 'cancel') return;
+  opts.filePath = filePath;
+  if (opts.start == null) opts.start = startT;
+  if (opts.end == null) opts.end = endT;
 
-  overlayMsg.textContent = preciseCheck.checked ? '正在精确导出（重新编码）…' : '正在无损导出…';
+  let target = 'saveAs';
+  if (needChoice) {
+    const choice = await window.api.saveChoice();
+    if (choice === 'cancel') return;
+    target = choice;
+  }
+  opts.target = target;
+
+  overlayMsg.textContent = msg;
   progressBar.style.width = '0%';
   progressPct.textContent = '0%';
   overlay.classList.remove('hidden');
-
   const off = window.api.onProgress((pct) => {
     progressBar.style.width = pct.toFixed(0) + '%';
     progressPct.textContent = pct.toFixed(0) + '%';
   });
 
   try {
-    const res = await window.api.exportClip({
-      filePath,
-      start: startT,
-      end: endT,
-      mode: preciseCheck.checked ? 'precise' : 'lossless',
-      target: choice
-    });
+    const res = await window.api.exportClip(opts);
     off();
     overlay.classList.add('hidden');
     if (res && res.canceled) return;
-    progressBar.style.width = '100%';
     toast('已保存：' + (res.outPath || ''));
   } catch (err) {
     off();
     overlay.classList.add('hidden');
     toast('导出失败：' + err.message, true);
   }
+}
+
+// Primary 完成 button: lossless, or quick frame-accurate via the 精确模式 checkbox.
+$('done-btn').addEventListener('click', () => {
+  performExport(
+    { kind: preciseCheck.checked ? 'precise' : 'lossless' },
+    { needChoice: true, msg: preciseCheck.checked ? '正在精确导出（重新编码）…' : '正在无损导出…' }
+  );
+});
+
+// ---------- advanced menu ----------
+const advBtn = $('adv-btn');
+const advMenu = $('adv-menu');
+const closeAdvMenu = () => advMenu.classList.add('hidden');
+
+advBtn.addEventListener('click', (e) => { e.stopPropagation(); advMenu.classList.toggle('hidden'); });
+document.addEventListener('click', (e) => {
+  if (!advMenu.classList.contains('hidden') && !advMenu.contains(e.target) && e.target !== advBtn) closeAdvMenu();
+});
+
+advMenu.addEventListener('click', (e) => {
+  const item = e.target.closest('.adv-item');
+  if (!item) return;
+  closeAdvMenu();
+  switch (item.dataset.act) {
+    case 'reencode': openModal('reencode-modal'); break;
+    case 'audio': openModal('audio-modal'); break;
+    case 'gif': openModal('gif-modal'); break;
+    case 'stripAudio': performExport({ kind: 'stripAudio' }, { needChoice: true, msg: '正在移除音频…' }); break;
+    case 'frame': performExport({ kind: 'frame', frameTime: video.currentTime, frameFormat: 'png' }, { msg: '正在导出当前帧…' }); break;
+  }
+});
+
+// ---------- modals ----------
+function openModal(id) { document.getElementById(id).classList.remove('hidden'); }
+function closeModal(el) { el.classList.add('hidden'); }
+document.querySelectorAll('.modal').forEach((m) => {
+  m.addEventListener('click', (e) => {
+    if (e.target === m || e.target.hasAttribute('data-close')) closeModal(m);
+  });
+});
+
+// --- Re-encode modal ---
+const reVcodec = $('re-vcodec');
+const reCrf = $('re-crf');
+const reCrfVal = $('re-crf-val');
+const reCrfLabel = $('re-crf-label');
+const reCrfWrap = $('re-crf-wrap');
+const reBitrateLabel = $('re-bitrate-label');
+const reBitrate = $('re-bitrate');
+const reRes = $('re-res');
+const reFps = $('re-fps');
+const reAudio = $('re-audio');
+const reContainer = $('re-container');
+
+reCrf.addEventListener('input', () => { reCrfVal.textContent = reCrf.value; });
+
+const HW_SUFFIXES = ['_videotoolbox', '_nvenc', '_qsv', '_amf'];
+const isHwCodec = (c) => HW_SUFFIXES.some((s) => c.endsWith(s));
+let HW_LIST = [];
+
+function syncReencodeUI() {
+  const codec = reVcodec.value;
+  const isHw = isHwCodec(codec);
+  const isCopy = codec === 'copy';
+  // Hardware encoders use a target bitrate; software codecs use CRF; copy uses neither.
+  reCrfLabel.classList.toggle('hidden', isHw || isCopy);
+  reCrfWrap.classList.toggle('hidden', isHw || isCopy);
+  reBitrateLabel.classList.toggle('hidden', !isHw);
+  reBitrate.classList.toggle('hidden', !isHw);
+  reRes.disabled = isCopy; // stream copy can't scale or change fps
+  reFps.disabled = isCopy;
+}
+reVcodec.addEventListener('change', syncReencodeUI);
+syncReencodeUI();
+
+// Inject this machine's working hardware encoders (auto-detected per platform)
+// into the codec dropdown. Hide the 硬件加速 preset if none are available.
+window.api.hwEncoders().then((list) => {
+  HW_LIST = list || [];
+  const vtBtn = document.querySelector('.preset[data-preset="vt"]');
+  if (!HW_LIST.length) { if (vtBtn) vtBtn.classList.add('hidden'); return; }
+  const vp9opt = reVcodec.querySelector('option[value="libvpx-vp9"]');
+  for (const enc of HW_LIST) {
+    const opt = document.createElement('option');
+    opt.value = enc.id;
+    opt.textContent = enc.label;
+    reVcodec.insertBefore(opt, vp9opt);
+  }
+});
+
+const PRESETS = {
+  h264: { vcodec: 'libx264', crf: 20, res: '', fps: '', audio: 'copy', container: 'mp4' },
+  h265: { vcodec: 'libx265', crf: 24, res: '', fps: '', audio: 'copy', container: 'mp4' },
+  vt:   { bitrate: '8M', res: '', fps: '', audio: 'copy', container: 'mp4' }, // vcodec chosen from HW_LIST
+  web:  { vcodec: 'libvpx-vp9', crf: 31, res: '1080', fps: '', audio: 'aac', container: 'webm' }
+};
+document.querySelectorAll('.preset').forEach((b) => {
+  b.addEventListener('click', () => {
+    const p = { ...PRESETS[b.dataset.preset] };
+    if (b.dataset.preset === 'vt') {
+      // Prefer a hardware H.265 encoder, else any available hardware encoder.
+      const hw = HW_LIST.find((c) => c.codec === 'hevc') || HW_LIST[0];
+      if (!hw) return;
+      p.vcodec = hw.id;
+    }
+    document.querySelectorAll('.preset').forEach((x) => x.classList.remove('active'));
+    b.classList.add('active');
+    if (p.vcodec) reVcodec.value = p.vcodec;
+    if (p.crf != null) { reCrf.value = p.crf; reCrfVal.textContent = p.crf; }
+    if (p.bitrate) reBitrate.value = p.bitrate;
+    reRes.value = p.res; reFps.value = p.fps; reAudio.value = p.audio; reContainer.value = p.container;
+    syncReencodeUI();
+  });
+});
+
+$('re-export').addEventListener('click', () => {
+  closeModal($('reencode-modal'));
+  performExport({
+    kind: 'reencode',
+    container: reContainer.value,
+    video: {
+      codec: reVcodec.value,
+      crf: Number(reCrf.value),
+      bitrate: reBitrate.value,
+      scaleH: reRes.value ? Number(reRes.value) : null,
+      fps: reFps.value ? Number(reFps.value) : null
+    },
+    audio: {
+      mode: reAudio.value === 'copy' ? 'copy' : reAudio.value === 'remove' ? 'remove' : 'encode',
+      bitrate: '192k'
+    }
+  }, { needChoice: true, msg: '正在重编码导出…' });
+});
+
+// --- Audio modal ---
+const auFormat = $('au-format');
+const auBitrate = $('au-bitrate');
+const auBitrateLabel = $('au-bitrate-label');
+function syncAudioUI() {
+  const lossless = auFormat.value === 'wav' || auFormat.value === 'flac';
+  auBitrate.classList.toggle('hidden', lossless);
+  auBitrateLabel.classList.toggle('hidden', lossless);
+}
+auFormat.addEventListener('change', syncAudioUI);
+syncAudioUI();
+$('au-export').addEventListener('click', () => {
+  closeModal($('audio-modal'));
+  performExport({ kind: 'audio', audioFormat: auFormat.value, audioBitrate: auBitrate.value }, { msg: '正在导出音频…' });
+});
+
+// --- GIF modal ---
+$('gif-export').addEventListener('click', () => {
+  closeModal($('gif-modal'));
+  performExport({
+    kind: 'gif',
+    gifFps: Number($('gif-fps').value),
+    gifWidth: $('gif-width').value ? Number($('gif-width').value) : null
+  }, { msg: '正在生成 GIF…' });
 });

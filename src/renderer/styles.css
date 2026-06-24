@@ -31,6 +31,13 @@ html, body {
   align-items: center;
   justify-content: center;
 }
+/* Draggable strip so the frameless window can be moved before a video loads. */
+.drag-strip {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 52px;
+  -webkit-app-region: drag;
+}
 .dropzone.dragover .drop-inner {
   border-color: var(--accent);
   background: var(--accent-dim);
@@ -88,6 +95,7 @@ html, body {
   cursor: pointer; font-size: 12px; line-height: 1;
 }
 .icon-btn:hover { background: #5a5a5c; }
+.topbar-actions { display: flex; align-items: center; gap: 8px; -webkit-app-region: no-drag; }
 .done-btn {
   border: none; border-radius: 7px; padding: 7px 18px;
   background: var(--accent); color: #1c1c1e; font-weight: 700; font-size: 14px;
@@ -95,6 +103,75 @@ html, body {
 }
 .done-btn:hover { filter: brightness(1.05); }
 .done-btn:active { transform: scale(0.97); }
+.adv-btn {
+  border: none; border-radius: 7px; padding: 7px 12px;
+  background: var(--panel-2); color: var(--text); font-size: 16px; line-height: 1;
+  cursor: pointer; font-weight: 700;
+}
+.adv-btn:hover { background: #48484a; }
+
+/* ---------- Advanced dropdown ---------- */
+.adv-menu {
+  position: absolute; top: 48px; right: 14px;
+  background: var(--panel-2); border: 1px solid #000; border-radius: 10px;
+  padding: 6px; min-width: 200px; z-index: 80;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+}
+.adv-item {
+  display: block; width: 100%; text-align: left;
+  background: none; border: none; color: var(--text);
+  font-size: 13px; padding: 9px 12px; border-radius: 6px; cursor: pointer;
+}
+.adv-item:hover { background: var(--accent); color: #1c1c1e; }
+.adv-sep { height: 1px; background: #000; margin: 6px 4px; }
+
+/* ---------- Modals (settings dialogs) ---------- */
+.modal {
+  position: absolute; inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 90;
+}
+.modal-box {
+  width: 460px; max-width: 86vw; max-height: 86vh; overflow-y: auto;
+  background: var(--panel); border-radius: 14px; padding: 22px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+}
+.modal-title { font-size: 17px; font-weight: 700; margin-bottom: 16px; }
+.preset-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
+.preset {
+  flex: 1 1 auto; min-width: 96px;
+  border: 1px solid #4a4a4c; border-radius: 8px; padding: 8px 6px;
+  background: var(--panel-2); color: var(--text); font-size: 12px; cursor: pointer;
+}
+.preset:hover { border-color: var(--accent); }
+.preset.active { background: var(--accent-dim); border-color: var(--accent); color: var(--text); }
+
+.form-grid {
+  display: grid; grid-template-columns: 96px 1fr; gap: 12px 14px;
+  align-items: center;
+}
+.form-grid > label { font-size: 13px; color: var(--text-dim); }
+.form-grid select,
+.form-grid .text-input {
+  width: 100%;
+  background: var(--panel-2); border: 1px solid #000; border-radius: 6px;
+  color: var(--text); font-size: 13px; padding: 7px 9px; outline: none;
+}
+.form-grid select:focus,
+.form-grid .text-input:focus { border-color: var(--accent); }
+.quality-wrap { display: flex; align-items: center; gap: 10px; }
+.quality-wrap input[type="range"] { flex: 1 1 auto; accent-color: var(--accent); }
+.quality-wrap span { font-variant-numeric: tabular-nums; min-width: 24px; text-align: right; }
+
+.modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 22px; }
+.btn-secondary, .btn-primary {
+  border: none; border-radius: 7px; padding: 8px 18px; font-size: 14px; cursor: pointer;
+}
+.btn-secondary { background: var(--panel-2); color: var(--text); }
+.btn-secondary:hover { background: #48484a; }
+.btn-primary { background: var(--accent); color: #1c1c1e; font-weight: 700; }
+.btn-primary:hover { filter: brightness(1.05); }
 
 .stage {
   position: relative;
@@ -217,7 +294,31 @@ html, body {
   font-size: 13px; color: var(--text-dim); cursor: pointer;
 }
 .precise-toggle input { accent-color: var(--accent); }
-.hint { margin-top: 8px; font-size: 11px; color: var(--text-dim); }
+
+/* "?" help badge with a hover/focus tooltip (replaces the always-on hint line) */
+.help {
+  position: relative;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 16px; height: 16px; margin-left: 8px;
+  border-radius: 50%;
+  background: #48484a; color: var(--text-dim);
+  font-size: 11px; font-weight: 700; cursor: help; user-select: none;
+}
+.help:hover, .help:focus { background: #5a5a5c; color: var(--text); outline: none; }
+.help-tip {
+  position: absolute; bottom: calc(100% + 8px); right: 0;
+  width: 280px; padding: 10px 12px;
+  border-radius: 8px;
+  background: #000; color: var(--text);
+  font-size: 12px; line-height: 1.55; font-weight: 400; text-align: left;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.55);
+  opacity: 0; visibility: hidden; transform: translateY(2px);
+  transition: opacity 0.12s ease, transform 0.12s ease;
+  pointer-events: none; z-index: 70;
+}
+.help:hover .help-tip, .help:focus .help-tip {
+  opacity: 1; visibility: visible; transform: translateY(0);
+}
 
 /* ---------- Overlay ---------- */
 .overlay {

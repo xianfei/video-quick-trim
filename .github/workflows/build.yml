@@ -29,9 +29,6 @@ jobs:
           - name: macOS (Apple Silicon)
             os: macos-14
             script: dist:mac
-          - name: macOS (Intel)
-            os: macos-13
-            script: dist:mac
 
     steps:
       - name: Checkout
