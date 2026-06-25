@@ -756,16 +756,19 @@ fn main() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building Quick Trim")
-        .run(|app, event| {
+        .run(|_app, _event| {
             // macOS delivers "Open With" / double-click as an Opened event.
-            if let tauri::RunEvent::Opened { urls } = event {
+            // (Windows/Linux receive the file via argv — handled in setup().)
+            // RunEvent::Opened only exists on macOS, so gate it out elsewhere.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Opened { urls } = _event {
                 for url in urls {
                     if let Ok(p) = url.to_file_path() {
                         let s = p.to_string_lossy().to_string();
-                        if let Some(state) = app.try_state::<PendingOpen>() {
+                        if let Some(state) = _app.try_state::<PendingOpen>() {
                             *state.0.lock().unwrap() = Some(s.clone());
                         }
-                        let _ = app.emit("open-file", s);
+                        let _ = _app.emit("open-file", s);
                     }
                 }
             }
