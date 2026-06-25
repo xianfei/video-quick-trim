@@ -1,0 +1,49 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Quick Trim",
+  "version": "1.0.0",
+  "identifier": "com.quicktrim.app",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Quick Trim",
+        "width": 1100,
+        "height": 720,
+        "minWidth": 720,
+        "minHeight": 520,
+        "dragDropEnabled": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "backgroundColor": "#1c1c1e"
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": {
+          "allow": ["**", "/**", "$HOME/**", "$DESKTOP/**", "$DOCUMENT/**", "$DOWNLOAD/**", "$MOVIE/**"],
+          "requireLiteralLeadingDot": false
+        }
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["dmg", "app", "nsis", "appimage"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "fileAssociations": [
+      { "ext": ["mp4", "mov", "mkv", "m4v", "avi", "webm", "ts", "flv", "wmv"], "role": "Viewer" }
+    ]
+  }
+}

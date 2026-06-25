@@ -1,8 +1,11 @@
 name: Build
 
-# Build the macOS (.dmg) and Windows (.exe) apps.
-# - Runs manually from the Actions tab (workflow_dispatch).
-# - Runs on every push to main / PR so breakage is caught early (artifacts only).
+# Builds BOTH versions and uploads them as clearly-named, separate artifacts:
+#   - quick-trim-electron-<os>-<arch>   (Electron, bundled ffmpeg)
+#   - quick-trim-tauri-<os>-<arch>      (Tauri, ffmpeg resolved/downloaded at runtime)
+# Release assets are prefixed electron-/tauri- so they don't collide.
+#
+# - Runs manually (workflow_dispatch) and on push to main / PR (artifacts only).
 # - On a version tag (v*), also publishes the installers to a GitHub Release.
 on:
   push:
@@ -16,8 +19,9 @@ permissions:
   contents: write # required for the Release step on tags
 
 jobs:
-  build:
-    name: ${{ matrix.name }}
+  # ---------- Electron (Chromium-bundled, ffmpeg bundled) ----------
+  electron:
+    name: Electron · ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -31,11 +35,8 @@ jobs:
             script: dist:mac
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
@@ -43,25 +44,27 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build app
+      - name: Build (electron-builder)
         run: npm run ${{ matrix.script }}
         env:
-          # Don't attempt code signing in CI (no certs) — produces an unsigned build.
-          CSC_IDENTITY_AUTO_DISCOVERY: false
-          # Helps ffmpeg-static avoid GitHub download rate limits.
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: false # unsigned CI build
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # ffmpeg-static download rate limits
 
-      - name: Upload installers (artifact)
-        uses: actions/upload-artifact@v4
+      - name: Prefix installers with "electron-"
+        shell: bash
+        run: |
+          shopt -s nullglob
+          for f in dist/*.dmg dist/*.exe; do
+            mv "$f" "dist/electron-$(basename "$f")"
+          done
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: quick-trim-${{ runner.os }}-${{ runner.arch }}
+          name: quick-trim-electron-${{ runner.os }}-${{ runner.arch }}
           if-no-files-found: ignore
           path: |
-            dist/*.dmg
-            dist/*.exe
-            dist/*.zip
-            dist/*.blockmap
-            dist/latest*.yml
+            dist/electron-*.dmg
+            dist/electron-*.exe
 
       - name: Publish to Release (tags only)
         if: startsWith(github.ref, 'refs/tags/')
@@ -69,7 +72,82 @@ jobs:
         with:
           fail_on_unmatched_files: false
           files: |
-            dist/*.dmg
-            dist/*.exe
-            dist/*.blockmap
-            dist/latest*.yml
+            dist/electron-*.dmg
+            dist/electron-*.exe
+
+  # ---------- Tauri (system WebView, ffmpeg at runtime, tiny installer) ----------
+  tauri:
+    name: Tauri · ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows (x64)
+            os: windows-latest
+          - name: macOS (Apple Silicon)
+            os: macos-14
+          - name: Linux (x64)
+            os: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install Linux WebKit / bundling deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev patchelf
+
+      # @tauri-apps/cli (a devDependency) provides the `tauri` binary; the rest of
+      # the install is unused by the Tauri build but harmless.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (tauri)
+        run: npm run tauri:build
+
+      - name: Prefix bundles with "tauri-" (+ Windows portable exe)
+        shell: bash
+        run: |
+          shopt -s nullglob
+          B=src-tauri/target/release/bundle
+          for f in "$B"/dmg/*.dmg "$B"/nsis/*.exe "$B"/appimage/*.AppImage "$B"/appimage/*.appimage; do
+            mv "$f" "$(dirname "$f")/tauri-$(basename "$f")"
+          done
+          # Windows免安装便携版：Tauri 的主 exe 本身自包含（用系统 WebView2），
+          # 直接作为便携版分发（需系统已装 WebView2，Win11/新版 Win10 默认有）。
+          if [ -f src-tauri/target/release/quick-trim.exe ]; then
+            mkdir -p "$B/nsis"
+            cp src-tauri/target/release/quick-trim.exe "$B/nsis/tauri-Quick-Trim-portable.exe"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quick-trim-tauri-${{ runner.os }}-${{ runner.arch }}
+          if-no-files-found: ignore
+          path: |
+            src-tauri/target/release/bundle/dmg/tauri-*.dmg
+            src-tauri/target/release/bundle/nsis/tauri-*.exe
+            src-tauri/target/release/bundle/appimage/tauri-*.AppImage
+
+      - name: Publish to Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: false
+          files: |
+            src-tauri/target/release/bundle/dmg/tauri-*.dmg
+            src-tauri/target/release/bundle/nsis/tauri-*.exe
+            src-tauri/target/release/bundle/appimage/tauri-*.AppImage

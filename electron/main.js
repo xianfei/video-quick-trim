@@ -5,6 +5,9 @@ const os = require('os');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 
+// Shared ffmpeg-arg logic (also used by the Tauri bridge) — single source of truth.
+const { buildArgs, outputExtFor, suffixFor, hmsToSeconds } = require('../ui/export-args.js');
+
 const VIDEO_EXTS = ['mp4', 'mov', 'mkv', 'm4v', 'avi', 'webm', 'ts', 'flv', 'wmv'];
 
 // Resolve bundled ffmpeg / ffprobe binaries. In a packaged app the binaries
@@ -13,7 +16,9 @@ function unpacked(p) {
   return p ? p.replace('app.asar', 'app.asar.unpacked') : p;
 }
 const ffmpegPath = unpacked(require('ffmpeg-static'));
-const ffprobePath = unpacked(require('ffprobe-static').path);
+// @ffprobe-installer ships a genuine per-arch binary (ffprobe-static mislabels an
+// x86_64 build as arm64, which forces Rosetta and flags the app as Intel).
+const ffprobePath = unpacked(require('@ffprobe-installer/ffprobe').path);
 
 let mainWindow = null;
 let pendingOpenPath = null; // a file to load once the window is ready
@@ -91,7 +96,7 @@ function createWindow() {
     }
   });
 
-  mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+  mainWindow.loadFile(path.join(__dirname, '..', 'ui', 'index.html'));
   mainWindow.on('closed', () => { mainWindow = null; });
 
   // Once the UI is ready, load any file the app was launched/opened with.
@@ -128,16 +133,6 @@ function run(cmd, args) {
       else reject(new Error(`${path.basename(cmd)} exited with code ${code}\n${stderr}`));
     });
   });
-}
-
-// Parse "HH:MM:SS.xx" or seconds string into seconds (number).
-function hmsToSeconds(t) {
-  if (typeof t === 'number') return t;
-  if (!t) return 0;
-  const parts = String(t).split(':').map(Number);
-  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-  if (parts.length === 2) return parts[0] * 60 + parts[1];
-  return Number(t) || 0;
 }
 
 // ---- IPC: probe -------------------------------------------------------------
@@ -194,16 +189,6 @@ ipcMain.handle('thumbnails', async (_evt, { filePath, count = 10, durationSec = 
   }
   return out;
 });
-
-// ---- IPC: export ------------------------------------------------------------
-
-// H.264 + AAC fit these containers; anything else gets remuxed to .mp4 in
-// precise mode.
-const MP4_LIKE = /\.(mp4|mov|m4v|mkv|ts)$/i;
-const MP4_OR_MOV = /\.(mp4|mov|m4v)$/i;
-const HW_SUFFIXES = ['_videotoolbox', '_nvenc', '_qsv', '_amf'];
-const isHwEncoder = (c) => HW_SUFFIXES.some((s) => c.endsWith(s));
-const isHevcEncoder = (c) => c === 'libx265' || /^hevc_/.test(c);
 
 // ---- hardware encoder detection --------------------------------------------
 
@@ -273,121 +258,6 @@ function detectHwEncoders() {
 }
 
 ipcMain.handle('hwEncoders', () => detectHwEncoders());
-
-// Output file extension for a given export descriptor.
-function outputExtFor(opts) {
-  const srcExt = path.extname(opts.filePath);
-  switch (opts.kind) {
-    case 'frame': return '.' + (opts.frameFormat || 'png');
-    case 'audio': return { mp3: '.mp3', m4a: '.m4a', aac: '.m4a', wav: '.wav', flac: '.flac' }[opts.audioFormat || 'mp3'];
-    case 'gif': return '.gif';
-    case 'reencode': return '.' + (opts.container || 'mp4');
-    case 'precise': return MP4_LIKE.test(srcExt) ? srcExt : '.mp4';
-    case 'stripAudio':
-    case 'lossless':
-    default: return srcExt;
-  }
-}
-
-// Default filename suffix for "save as".
-function suffixFor(kind) {
-  return { frame: '_frame', audio: '_audio', gif: '', stripAudio: '_noaudio' }[kind] ?? '_trimmed';
-}
-
-// Build the ffmpeg argument list for a given export descriptor + output path.
-function buildArgs(opts, outPath) {
-  const ss = hmsToSeconds(opts.start);
-  const dur = Math.max(0.001, hmsToSeconds(opts.end) - ss);
-  const inSeek = ['-ss', String(ss), '-i', opts.filePath, '-t', String(dur)];
-  const faststart = () => (MP4_OR_MOV.test(outPath) ? ['-movflags', '+faststart'] : []);
-
-  switch (opts.kind) {
-    case 'frame': {
-      // A single still from the current playhead position.
-      const t = hmsToSeconds(opts.frameTime != null ? opts.frameTime : ss);
-      const q = /\.png$/i.test(outPath) ? [] : ['-q:v', '2'];
-      return ['-ss', String(t), '-i', opts.filePath, '-frames:v', '1', ...q, '-y', outPath];
-    }
-
-    case 'audio': {
-      const abr = opts.audioBitrate || '192k';
-      const enc = {
-        mp3: ['-c:a', 'libmp3lame', '-b:a', abr],
-        m4a: ['-c:a', 'aac', '-b:a', abr],
-        aac: ['-c:a', 'aac', '-b:a', abr],
-        wav: ['-c:a', 'pcm_s16le'],
-        flac: ['-c:a', 'flac']
-      }[opts.audioFormat || 'mp3'] || ['-c:a', 'libmp3lame', '-b:a', abr];
-      return [...inSeek, '-vn', ...enc, '-y', outPath];
-    }
-
-    case 'gif': {
-      const fps = opts.gifFps || 15;
-      const scale = opts.gifWidth ? `,scale=${opts.gifWidth}:-1:flags=lanczos` : '';
-      // One-pass high-quality GIF: build an optimal palette, then apply it.
-      const fc = `[0:v]fps=${fps}${scale},split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=5`;
-      return [...inSeek, '-filter_complex', fc, '-y', outPath];
-    }
-
-    case 'stripAudio':
-      return [...inSeek, '-map', '0:v?', '-map', '0:s?', '-c', 'copy', '-an',
-        '-avoid_negative_ts', 'make_zero', '-y', outPath];
-
-    case 'precise': {
-      // Frame-accurate: re-encode the selection to H.264/AAC.
-      return [...inSeek, '-c:v', 'libx264', '-crf', '18', '-preset', 'veryfast',
-        '-c:a', 'aac', '-b:a', '192k', ...faststart(), '-y', outPath];
-    }
-
-    case 'reencode': {
-      const v = opts.video || {};
-      const a = opts.audio || {};
-      const container = opts.container || 'mp4';
-      const args = [...inSeek];
-
-      // Video filters (scale / fps) only apply when actually re-encoding.
-      const vf = [];
-      if (v.fps) vf.push(`fps=${v.fps}`);
-      if (v.scaleH) vf.push(`scale=-2:${v.scaleH}`);
-
-      if (v.codec === 'copy') {
-        args.push('-c:v', 'copy'); // filters not possible with stream copy
-      } else {
-        if (vf.length) args.push('-vf', vf.join(','));
-        const codec = v.codec || 'libx264';
-        args.push('-c:v', codec);
-        if (isHwEncoder(codec)) {
-          args.push('-b:v', v.bitrate || '8M'); // hardware encoders are bitrate-driven
-        } else if (codec === 'libvpx-vp9') {
-          args.push('-b:v', '0', '-crf', String(v.crf != null ? v.crf : 31));
-        } else { // libx264 / libx265
-          args.push('-crf', String(v.crf != null ? v.crf : 23), '-preset', v.preset || 'medium');
-        }
-        // QuickTime needs the hvc1 tag to recognise HEVC in mp4/mov.
-        if (isHevcEncoder(codec) && MP4_OR_MOV.test(outPath)) args.push('-tag:v', 'hvc1');
-      }
-
-      // Audio
-      if (a.mode === 'remove') {
-        args.push('-an');
-      } else if (a.mode === 'copy') {
-        args.push('-c:a', 'copy');
-      } else {
-        // WebM only takes Opus/Vorbis; everything else gets AAC.
-        args.push('-c:a', container === 'webm' ? 'libopus' : 'aac', '-b:a', a.bitrate || '192k');
-      }
-
-      return [...args, ...faststart(), '-y', outPath];
-    }
-
-    case 'lossless':
-    default:
-      // Lossless stream copy (keyframe-aligned start). Map only v/a/s with '?'
-      // so problematic data/timecode/attachment streams don't abort the remux.
-      return [...inSeek, '-map', '0:v?', '-map', '0:a?', '-map', '0:s?',
-        '-c', 'copy', '-avoid_negative_ts', 'make_zero', '-y', outPath];
-  }
-}
 
 function runFfmpegWithProgress(args, totalDur, evt) {
   return new Promise((resolve, reject) => {

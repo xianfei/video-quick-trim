@@ -34,6 +34,8 @@ let duration = 0;
 let startT = 0;
 let endT = 0;
 const MIN_GAP = 0.05;
+let ffmpegReady = false;       // Tauri: set once ffmpeg is found/installed
+let pendingLoadPath = null;    // a file to load after ffmpeg becomes ready
 
 // ---------- time helpers ----------
 const pad = (n) => String(n).padStart(2, '0');
@@ -59,12 +61,9 @@ function parseTime(str) {
   return null;                                         // reject anything else
 }
 
-function toFileURL(p) {
-  const s = p.replace(/\\/g, '/');
-  const enc = (x) => encodeURI(x).replace(/#/g, '%23').replace(/\?/g, '%3F');
-  if (s.startsWith('//')) return 'file:' + enc(s);          // UNC \\server\share -> file://server/share
-  return 'file://' + enc(s.startsWith('/') ? s : '/' + s);  // POSIX or Windows drive (C:/...)
-}
+// Resolve a filesystem path into a <video>-playable URL. Provided by the
+// platform bridge (Electron: file:// ; Tauri: local http media server).
+const toMediaSrc = (p) => window.api.toMediaSrc(p);
 
 // ---------- toast ----------
 let toastTimer = null;
@@ -78,6 +77,8 @@ function toast(msg, isError = false) {
 
 // ---------- load a video ----------
 async function loadVideo(p) {
+  // ffmpeg must be available before we can probe/preview (Tauri may need setup).
+  if (!ffmpegReady) { pendingLoadPath = p; showFfmpegModal(); return; }
   try {
     const info = await window.api.probe(p);
     filePath = p;
@@ -86,7 +87,8 @@ async function loadVideo(p) {
     endT = duration;
 
     filenameEl.textContent = info.name;
-    video.src = toFileURL(p);
+    if (window.api.whenReady) await window.api.whenReady(); // media-server base ready (Tauri)
+    video.src = toMediaSrc(p);
     video.load();
 
     dropzone.classList.add('hidden');
@@ -280,28 +282,91 @@ async function openFile() {
   if (p) loadVideo(p);
 }
 
-// Use an enter/leave depth counter so the highlight doesn't flicker as the
-// cursor crosses child elements, and clears reliably on an abandoned drag.
-let dragDepth = 0;
-document.body.addEventListener('dragenter', (e) => { e.preventDefault(); dragDepth++; dropzone.classList.add('dragover'); });
-document.body.addEventListener('dragover', (e) => { e.preventDefault(); });
-document.body.addEventListener('dragleave', (e) => {
-  e.preventDefault();
-  dragDepth = Math.max(0, dragDepth - 1);
-  if (dragDepth === 0) dropzone.classList.remove('dragover');
-});
-document.body.addEventListener('drop', (e) => {
-  e.preventDefault();
-  dragDepth = 0;
-  dropzone.classList.remove('dragover');
-  const file = e.dataTransfer.files && e.dataTransfer.files[0];
-  if (!file) return;
-  const p = window.api.getPathForFile(file);
-  if (p) loadVideo(p);
+// Drag-and-drop is handled by the platform bridge (Electron DOM events / Tauri
+// native drag-drop events), surfaced uniformly via window.api.onFileDrop.
+if (window.api.onFileDrop) window.api.onFileDrop({
+  onEnter: () => dropzone.classList.add('dragover'),
+  onLeave: () => dropzone.classList.remove('dragover'),
+  onDrop: (p) => { dropzone.classList.remove('dragover'); if (p) loadVideo(p); }
 });
 
 // Load a file the app was launched/opened with (double-click, "Open With").
 if (window.api.onOpenFile) window.api.onOpenFile((p) => { if (p) loadVideo(p); });
+
+// ---------- ffmpeg setup (Tauri: ffmpeg isn't bundled) ----------
+const ffModal = $('ffmpeg-modal');
+const ffActions = $('ff-actions');
+const ffProgressWrap = $('ff-progress-wrap');
+const ffBar = $('ff-bar');
+const ffPct = $('ff-pct');
+
+let ffDownloading = false;
+function showFfmpegModal() { if (ffModal) ffModal.classList.remove('hidden'); }
+function hideFfmpegModal() { if (ffModal) ffModal.classList.add('hidden'); }
+// Reset to the action buttons (used when reopened from the ⋯ menu).
+function openFfmpegModal() {
+  ffActions.classList.remove('hidden');
+  ffProgressWrap.classList.add('hidden');
+  showFfmpegModal();
+}
+// The ffmpeg modal closes on backdrop click, but never mid-download.
+if (ffModal) ffModal.addEventListener('click', (e) => {
+  if (e.target === ffModal && !ffDownloading) hideFfmpegModal();
+});
+
+function onFfmpegReady() {
+  ffmpegReady = true;
+  hideFfmpegModal();
+  loadHwEncoders();
+  // "设置 ffmpeg…" is only meaningful where ffmpeg isn't bundled (Tauri).
+  if (window.api.downloadFfmpeg) { const m = document.getElementById('adv-ffmpeg'); if (m) m.classList.remove('hidden'); }
+  if (pendingLoadPath) { const p = pendingLoadPath; pendingLoadPath = null; loadVideo(p); }
+}
+
+// Decide on startup whether ffmpeg is available. Electron always returns true;
+// Tauri returns false when ffmpeg isn't found → we show the setup modal.
+(function initFfmpeg() {
+  if (!window.api.ffmpegStatus) { onFfmpegReady(); return; } // no gate → ready
+  window.api.ffmpegStatus().then((ok) => {
+    if (ok) onFfmpegReady();
+    else showFfmpegModal();
+  }).catch(() => showFfmpegModal());
+})();
+
+const ffDownloadBtn = $('ff-download');
+if (ffDownloadBtn) ffDownloadBtn.addEventListener('click', async () => {
+  ffActions.classList.add('hidden');
+  ffProgressWrap.classList.remove('hidden');
+  ffBar.style.width = '0%';
+  ffPct.textContent = '0%';
+  ffDownloading = true;
+  const off = window.api.onFfmpegProgress ? window.api.onFfmpegProgress((pct) => {
+    if (pct < 0) { ffBar.classList.add('indeterminate'); ffBar.style.width = '100%'; ffPct.textContent = '下载中…'; }
+    else { ffBar.classList.remove('indeterminate'); ffBar.style.width = pct.toFixed(0) + '%'; ffPct.textContent = pct.toFixed(0) + '%'; }
+  }) : null;
+  try {
+    await window.api.downloadFfmpeg();
+    if (off) off();
+    ffDownloading = false;
+    onFfmpegReady();
+  } catch (err) {
+    if (off) off();
+    ffDownloading = false;
+    ffProgressWrap.classList.add('hidden');
+    ffActions.classList.remove('hidden');
+    toast('下载失败：' + (err && err.message ? err.message : err), true);
+  }
+});
+
+const ffPickBtn = $('ff-pick');
+if (ffPickBtn) ffPickBtn.addEventListener('click', async () => {
+  try {
+    const ok = await window.api.pickAndSetFfmpeg();
+    if (ok) onFfmpegReady();
+  } catch (err) {
+    toast(err && err.message ? err.message : String(err), true);
+  }
+});
 
 // ---------- export ----------
 // Single entry point for every export kind. opts.filePath/start/end are filled
@@ -370,6 +435,7 @@ advMenu.addEventListener('click', (e) => {
     case 'gif': openModal('gif-modal'); break;
     case 'stripAudio': performExport({ kind: 'stripAudio' }, { needChoice: true, msg: '正在移除音频…' }); break;
     case 'frame': performExport({ kind: 'frame', frameTime: video.currentTime, frameFormat: 'png' }, { msg: '正在导出当前帧…' }); break;
+    case 'ffmpeg': openFfmpegModal(); break;
   }
 });
 
@@ -377,6 +443,7 @@ advMenu.addEventListener('click', (e) => {
 function openModal(id) { document.getElementById(id).classList.remove('hidden'); }
 function closeModal(el) { el.classList.add('hidden'); }
 document.querySelectorAll('.modal').forEach((m) => {
+  if (m.id === 'ffmpeg-modal') return; // handled separately (no dismiss mid-download)
   m.addEventListener('click', (e) => {
     if (e.target === m || e.target.hasAttribute('data-close')) closeModal(m);
   });
@@ -418,18 +485,24 @@ syncReencodeUI();
 
 // Inject this machine's working hardware encoders (auto-detected per platform)
 // into the codec dropdown. Hide the 硬件加速 preset if none are available.
-window.api.hwEncoders().then((list) => {
-  HW_LIST = list || [];
-  const vtBtn = document.querySelector('.preset[data-preset="vt"]');
-  if (!HW_LIST.length) { if (vtBtn) vtBtn.classList.add('hidden'); return; }
-  const vp9opt = reVcodec.querySelector('option[value="libvpx-vp9"]');
-  for (const enc of HW_LIST) {
-    const opt = document.createElement('option');
-    opt.value = enc.id;
-    opt.textContent = enc.label;
-    reVcodec.insertBefore(opt, vp9opt);
-  }
-});
+// Called once ffmpeg is ready (detection needs to run ffmpeg).
+let hwLoaded = false;
+function loadHwEncoders() {
+  if (hwLoaded) return;
+  hwLoaded = true;
+  window.api.hwEncoders().then((list) => {
+    HW_LIST = list || [];
+    const vtBtn = document.querySelector('.preset[data-preset="vt"]');
+    if (!HW_LIST.length) { if (vtBtn) vtBtn.classList.add('hidden'); return; }
+    const vp9opt = reVcodec.querySelector('option[value="libvpx-vp9"]');
+    for (const enc of HW_LIST) {
+      const opt = document.createElement('option');
+      opt.value = enc.id;
+      opt.textContent = enc.label;
+      reVcodec.insertBefore(opt, vp9opt);
+    }
+  });
+}
 
 const PRESETS = {
   h264: { vcodec: 'libx264', crf: 20, res: '', fps: '', audio: 'copy', container: 'mp4' },

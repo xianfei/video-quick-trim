@@ -339,6 +339,17 @@ html, body {
   height: 100%; width: 0%;
   background: var(--accent); transition: width 0.15s ease;
 }
+.progress-bar.indeterminate { animation: qt-pulse 1.1s ease-in-out infinite; }
+@keyframes qt-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+
+/* ffmpeg setup modal */
+.ff-desc { font-size: 13px; color: var(--text-dim); line-height: 1.6; margin-bottom: 18px; }
+.ff-actions { display: flex; flex-direction: column; gap: 10px; }
+.ff-actions .btn-primary, .ff-actions .btn-secondary { width: 100%; padding: 11px; }
+.ff-progress { margin-top: 4px; }
+.ff-progress-msg { font-size: 13px; margin-bottom: 12px; text-align: center; }
+.ff-progress .progress { height: 8px; border-radius: 4px; background: #111; overflow: hidden; }
+.ff-progress .progress-pct { text-align: center; }
 .progress-pct { margin-top: 10px; font-size: 13px; color: var(--text-dim); }
 
 /* ---------- Toast ---------- */

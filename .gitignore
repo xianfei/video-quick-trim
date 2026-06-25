@@ -23,3 +23,7 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# Rust / Tauri build artifacts
+src-tauri/target/
+src-tauri/gen/

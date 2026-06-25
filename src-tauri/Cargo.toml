@@ -1,0 +1,29 @@
+[package]
+name = "quick-trim"
+version = "1.0.0"
+description = "极简无损视频裁剪工具 (Quick Trim)"
+edition = "2021"
+rust-version = "1.77"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+# Tauri build is intentionally Node-free; ffmpeg is resolved from PATH or
+# downloaded on demand (with the user's consent) instead of being bundled.
+ffmpeg-sidecar = "2"
+which = "7"
+ureq = "2"
+# Tiny localhost HTTP server with byte-range support, so large videos stream in
+# the webview (WKWebView's custom asset:// scheme can't range-serve big files).
+tiny_http = "0.12"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
