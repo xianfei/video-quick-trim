@@ -34,6 +34,7 @@ contextBridge.exposeInMainWorld('api', {
 
   // Electron bundles ffmpeg, so it's always ready — no download/pick flow.
   ffmpegStatus: () => Promise.resolve(true),
+  ffmpegInfo: () => ipcRenderer.invoke('ffmpegInfo'),
 
   // Uniform drag-and-drop: wire DOM events and resolve the dropped file's path
   // via webUtils. (The Tauri bridge implements the same surface using native

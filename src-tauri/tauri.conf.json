@@ -18,7 +18,9 @@
         "dragDropEnabled": true,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
-        "backgroundColor": "#1c1c1e"
+        "backgroundColor": "#1c1c1e",
+        "theme": "Dark",
+        "trafficLightPosition": { "x": 12, "y": 27 }
       }
     ],
     "security": {

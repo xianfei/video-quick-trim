@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, nativeTheme } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -88,6 +88,9 @@ function createWindow() {
     titleBarOverlay: process.platform === 'win32'
       ? { color: '#28282a', symbolColor: '#f2f2f7', height: 52 }
       : false,
+    // macOS: drop the inset traffic lights onto the 52px top bar's mid-line so
+    // they share a centerline with the title text and buttons. Ignored elsewhere.
+    trafficLightPosition: { x: 18, y: 18 },
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -106,6 +109,7 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  nativeTheme.themeSource = 'dark'; // force dark native UI (menus, scrollbars, <select>/range controls)
   checkBinaries();
   detectHwEncoders(); // warm the cache so the re-encode modal is instant
   createWindow();
@@ -258,6 +262,14 @@ function detectHwEncoders() {
 }
 
 ipcMain.handle('hwEncoders', () => detectHwEncoders());
+
+// Electron ships ffmpeg/ffprobe inside the app — report them for the setup modal.
+ipcMain.handle('ffmpegInfo', () => ({
+  available: true,
+  ffmpeg: ffmpegPath,
+  ffprobe: ffprobePath,
+  source: 'bundled'
+}));
 
 function runFfmpegWithProgress(args, totalDur, evt) {
   return new Promise((resolve, reject) => {

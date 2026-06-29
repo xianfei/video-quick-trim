@@ -301,6 +301,39 @@ fn ffmpeg_status(app: tauri::AppHandle) -> bool {
     resolve_tools(&app).is_some()
 }
 
+#[derive(serde::Serialize)]
+struct FfmpegInfo {
+    available: bool,
+    ffmpeg: Option<String>,
+    ffprobe: Option<String>,
+    source: String, // "downloaded" (in app data) | "system" (PATH/common/manual) | "none"
+}
+
+// Where the currently-resolved ffmpeg comes from, so the setup modal can show it
+// instead of always prompting to download.
+#[tauri::command]
+fn ffmpeg_info(app: tauri::AppHandle) -> FfmpegInfo {
+    match resolve_tools(&app) {
+        Some(t) => {
+            let downloaded = managed_dir(&app)
+                .ok()
+                .map_or(false, |dir| t.ffmpeg.starts_with(&dir));
+            FfmpegInfo {
+                available: true,
+                ffmpeg: Some(t.ffmpeg.to_string_lossy().into_owned()),
+                ffprobe: t.ffprobe.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                source: if downloaded { "downloaded" } else { "system" }.into(),
+            }
+        }
+        None => FfmpegInfo {
+            available: false,
+            ffmpeg: None,
+            ffprobe: None,
+            source: "none".into(),
+        },
+    }
+}
+
 fn download_with_progress(app: &tauri::AppHandle, url: &str, dest: &Path) -> Result<(), String> {
     use std::io::{Read, Write};
     let resp = ureq::get(url).call().map_err(|e| e.to_string())?;
@@ -752,7 +785,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             probe, thumbnails, hw_encoders, run_export,
             open_dialog, save_dialog, save_choice, take_pending_open,
-            ffmpeg_status, download_ffmpeg, pick_and_set_ffmpeg, media_base
+            ffmpeg_status, ffmpeg_info, download_ffmpeg, pick_and_set_ffmpeg, media_base
         ])
         .build(tauri::generate_context!())
         .expect("error while building Quick Trim")

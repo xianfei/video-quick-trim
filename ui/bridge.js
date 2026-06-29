@@ -121,6 +121,7 @@
     // ffmpeg availability (Tauri doesn't bundle it). The UI asks the user to
     // download or pick one manually when it's missing.
     ffmpegStatus: () => invoke('ffmpeg_status'),
+    ffmpegInfo: () => invoke('ffmpeg_info'),
     downloadFfmpeg: () => invoke('download_ffmpeg'),
     pickAndSetFfmpeg: () => invoke('pick_and_set_ffmpeg'),
     onFfmpegProgress: (cb) => {

@@ -224,12 +224,18 @@
     </div>
   </div>
 
-  <!-- ffmpeg setup (Tauri only — shown when ffmpeg isn't found) -->
+  <!-- ffmpeg setup (Tauri: shown when ffmpeg isn't found, or via ⋯ → 设置 ffmpeg…) -->
   <div id="ffmpeg-modal" class="modal hidden">
     <div class="modal-box">
-      <div class="modal-title">需要 ffmpeg</div>
-      <p class="ff-desc">未在系统中找到 ffmpeg。精简版不预置 ffmpeg，你可以自动下载，或手动指定一个已有的 ffmpeg 可执行文件。</p>
+      <div class="modal-title" id="ff-title">ffmpeg</div>
+      <div id="ff-status" class="ff-status hidden">
+        <div class="ff-status-line"><span class="ff-dot"></span><span id="ff-status-text"></span></div>
+        <div id="ff-path" class="ff-path"></div>
+        <div id="ff-note" class="ff-note hidden"></div>
+      </div>
+      <p class="ff-desc" id="ff-desc"></p>
       <div id="ff-actions" class="ff-actions">
+        <button id="ff-done" class="btn-primary hidden">完成</button>
         <button id="ff-download" class="btn-primary">自动下载（约 40MB，仅一次）</button>
         <button id="ff-pick" class="btn-secondary">手动选择 ffmpeg…</button>
       </div>

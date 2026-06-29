@@ -78,7 +78,7 @@ function toast(msg, isError = false) {
 // ---------- load a video ----------
 async function loadVideo(p) {
   // ffmpeg must be available before we can probe/preview (Tauri may need setup).
-  if (!ffmpegReady) { pendingLoadPath = p; showFfmpegModal(); return; }
+  if (!ffmpegReady) { pendingLoadPath = p; presentFfmpegModal(); return; }
   try {
     const info = await window.api.probe(p);
     filePath = p;
@@ -90,6 +90,7 @@ async function loadVideo(p) {
     if (window.api.whenReady) await window.api.whenReady(); // media-server base ready (Tauri)
     video.src = toMediaSrc(p);
     video.load();
+    setCaptureSource(p); // hidden decoder that feeds the fine-tune loupe's neighbour frames
 
     dropzone.classList.add('hidden');
     editor.classList.remove('hidden');
@@ -147,29 +148,204 @@ function updateInputs() {
   durLabel.textContent = formatTime(Math.max(0, endT - startT));
 }
 
-// ---------- handle dragging ----------
+// ---------- handle dragging (QuickLook-style precision fine-tuning) ----------
+// "Pull up to fine-tune", like iOS variable-speed scrubbing:
+//   • Drag horizontally as usual — the handle tracks the cursor 1:1 (跟手).
+//   • Drag the cursor UP off the timeline and the px→time mapping gears down
+//     (every HALVE_PX of lift halves the sensitivity), so a long mouse sweep
+//     becomes a frame-level nudge. Return to the timeline level → back to 1:1.
+// We integrate relative deltas (curT += dx · gain); at gain 1 that's identical
+// to direct positioning, so unfine drags drift not at all.
+const DRAG = {
+  DEAD: 22,        // px of upward slack before gearing engages
+  HALVE_PX: 90,    // each HALVE_PX of additional lift halves sensitivity
+  GAIN_MIN: 0.05,  // finest mapping (5% of 1:1)
+  TILES: 5,        // neighbor frames shown in the loupe (odd → middle is the exact frame)
+  STEP_BASE: 1.0,  // seconds between adjacent frames at gain 1; shrinks with the gear
+  SETTLE_MS: 70    // debounce before rendering the neighbor frames
+};
+
+// Map upward lift (px above the grab point) → sensitivity gain in [GAIN_MIN, 1].
+function gainForLift(lift) {
+  const over = lift - DRAG.DEAD;
+  if (over <= 0) return 1;
+  return Math.max(DRAG.GAIN_MIN, Math.pow(0.5, over / DRAG.HALVE_PX));
+}
+
+// --- frame loupe: a row of the REAL frames surrounding the cut point, captured
+// live by drawing a hidden <video> to canvases (no ffmpeg round-trip; identical
+// in both backends). The gap between adjacent frames tracks the gear — the finer
+// you fine-tune, the closer together (down to ~1 frame) they sit. ---
+const TILE_W = 52;
+let loupeEl = null, loupeRow = null, loupeTime = null, loupeHint = null, loupeArrow = null;
+let loupeShown = false;
+let loupeTiles = [];           // <canvas> per frame; middle index is the exact cut
+let framesCapable = false;     // false when the codec can't be decoded for preview
+
+// A second, independently-seekable decoder used only to grab neighbour frames,
+// so the main preview's playhead is never disturbed.
+let capVideo = null, capGen = 0, settleTimer = null;
+function ensureCapVideo() {
+  if (capVideo) return;
+  capVideo = document.createElement('video');
+  capVideo.muted = true; capVideo.playsInline = true; capVideo.preload = 'auto';
+  capVideo.style.cssText = 'position:fixed;left:-10000px;top:0;width:2px;height:2px;opacity:0;pointer-events:none;';
+  document.body.appendChild(capVideo);
+}
+function setCaptureSource(p) {
+  ensureCapVideo();
+  capVideo.src = toMediaSrc(p);
+  capVideo.load();
+}
+
+const tileCenter = () => (DRAG.TILES - 1) / 2;
+function ensureLoupe() {
+  if (loupeEl) return;
+  loupeEl = document.createElement('div');
+  loupeEl.className = 'loupe';
+  loupeEl.innerHTML =
+    '<div class="loupe-view"><div class="loupe-row"></div></div>' +
+    '<div class="loupe-time">00:00:00.000</div>' +
+    '<div class="loupe-hint">↑ 向上拖动可微调</div>' +
+    '<div class="loupe-arrow"></div>';
+  document.body.appendChild(loupeEl);
+  loupeRow = loupeEl.querySelector('.loupe-row');
+  loupeTime = loupeEl.querySelector('.loupe-time');
+  loupeHint = loupeEl.querySelector('.loupe-hint');
+  loupeArrow = loupeEl.querySelector('.loupe-arrow');
+}
+function buildLoupeTiles() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const tileH = vw && vh ? Math.max(24, Math.min(64, Math.round((TILE_W * vh) / vw))) : 30;
+  loupeRow.innerHTML = '';
+  loupeTiles = [];
+  for (let i = 0; i < DRAG.TILES; i++) {
+    const c = document.createElement('canvas');
+    c.width = TILE_W; c.height = tileH;
+    c.className = 'loupe-tile' + (i === tileCenter() ? ' center' : '');
+    loupeRow.appendChild(c);
+    loupeTiles.push(c);
+  }
+}
+// Times of the frames to show: centred on t, spaced by a gear-scaled step.
+function tileTimes(t, gain) {
+  const step = Math.max(1 / 60, DRAG.STEP_BASE * gain);
+  const arr = [];
+  for (let i = 0; i < DRAG.TILES; i++) arr.push(Math.max(0, Math.min(duration || 0, t + (i - tileCenter()) * step)));
+  return arr;
+}
+function drawTile(idx, srcVideo) {
+  const c = loupeTiles[idx];
+  const vw = srcVideo.videoWidth, vh = srcVideo.videoHeight;
+  if (!c || !vw || !vh) return;
+  const scale = Math.max(c.width / vw, c.height / vh); // cover
+  const dw = vw * scale, dh = vh * scale;
+  c.getContext('2d').drawImage(srcVideo, (c.width - dw) / 2, (c.height - dh) / 2, dw, dh);
+}
+function seekCapture(t) {
+  return new Promise((resolve) => {
+    if (!capVideo || capVideo.readyState < 1) return resolve(false);
+    if (Math.abs(capVideo.currentTime - t) < 1e-3 && capVideo.readyState >= 2) return resolve(true);
+    let done = false;
+    const finish = (ok) => { if (done) return; done = true; capVideo.removeEventListener('seeked', onSeeked); clearTimeout(to); resolve(ok); };
+    const onSeeked = () => finish(true);
+    const to = setTimeout(() => finish(false), 500);
+    capVideo.addEventListener('seeked', onSeeked);
+    try { capVideo.currentTime = t; } catch (_) { finish(false); }
+  });
+}
+// Seek the hidden decoder to each neighbour time in turn and paint its tile.
+// `gen` guards against a newer drag position superseding this pass mid-flight.
+async function captureNeighbors(times, gen) {
+  for (let i = 0; i < times.length; i++) {
+    if (i === tileCenter()) continue;     // centre is painted from the main preview
+    if (gen !== capGen) return;
+    const ok = await seekCapture(times[i]);
+    if (gen !== capGen) return;
+    if (ok) drawTile(i, capVideo);
+  }
+}
+
+function positionLoupe(t) {
+  const LW = loupeEl.offsetWidth || 280;
+  const rect = track.getBoundingClientRect();
+  const hx = rect.left + (duration > 0 ? (t / duration) * rect.width : 0);
+  const left = Math.max(6, Math.min(window.innerWidth - LW - 6, hx - LW / 2));
+  loupeEl.style.left = left + 'px';
+  loupeEl.style.top = (rect.top - (loupeEl.offsetHeight || 96) - 12) + 'px';
+  loupeArrow.style.left = Math.max(12, Math.min(LW - 12, hx - left)) + 'px'; // keep pointing at the handle even when clamped
+}
+function updateLoupe(t, gain) {
+  if (!loupeShown) return;
+  loupeTime.textContent = formatTime(t);
+  const fine = gain < 0.999;
+  loupeHint.textContent = fine ? ('精调 ' + Math.round(1 / gain) + '×') : '↑ 向上拖动可微调';
+  loupeHint.classList.toggle('fine', fine);
+
+  if (framesCapable) {
+    drawTile(tileCenter(), video);        // live centre frame, straight from the main preview
+    const times = tileTimes(t, gain);
+    const gen = ++capGen;                 // invalidate any in-flight neighbour capture
+    clearTimeout(settleTimer);
+    settleTimer = setTimeout(() => { drawTile(tileCenter(), video); captureNeighbors(times, gen); }, DRAG.SETTLE_MS);
+  }
+  positionLoupe(t);
+}
+function showLoupe(t, gain) {
+  ensureLoupe();
+  if (!loupeShown) {
+    loupeShown = true;
+    loupeEl.classList.toggle('no-frames', !framesCapable);
+    if (framesCapable) buildLoupeTiles();
+    loupeEl.classList.add('show');
+  }
+  updateLoupe(t, gain);
+}
+function hideLoupe() {
+  loupeShown = false;
+  capGen++;                                // cancel any pending capture
+  clearTimeout(settleTimer);
+  if (loupeEl) loupeEl.classList.remove('show');
+}
+
 function beginDrag(which, ev) {
   ev.preventDefault();
   const rect = track.getBoundingClientRect();
-  const move = (e) => {
-    const x = Math.min(rect.width, Math.max(0, e.clientX - rect.left));
-    let t = (x / rect.width) * duration;
+  const handleEl = which === 'start' ? handleStart : handleEnd;
+  let lastX = ev.clientX;
+  const refY = ev.clientY;        // gearing is measured as upward lift from here
+  let curGain = 1;
+  const curT = () => (which === 'start' ? startT : endT);
+
+  const apply = (t) => {
     if (which === 'start') {
-      startT = Math.min(t, endT - MIN_GAP);
-      startT = Math.max(0, startT);
+      startT = Math.max(0, Math.min(t, endT - MIN_GAP));
       video.currentTime = startT;
     } else {
-      endT = Math.max(t, startT + MIN_GAP);
-      endT = Math.min(duration, endT);
+      endT = Math.min(duration, Math.max(t, startT + MIN_GAP));
       video.currentTime = endT;
     }
     renderSelection();
     updateInputs();
+    updateLoupe(curT(), curGain);
   };
+
+  const move = (e) => {
+    const dx = e.clientX - lastX;
+    lastX = e.clientX;
+    curGain = gainForLift(refY - e.clientY);
+    if (!loupeShown) showLoupe(curT(), curGain); // teaches the up-drag from the first move
+    apply(curT() + (dx / rect.width) * duration * curGain);
+    handleEl.classList.toggle('focusing', curGain < 0.999);
+  };
+
   const up = () => {
     window.removeEventListener('mousemove', move);
     window.removeEventListener('mouseup', up);
+    handleEl.classList.remove('focusing');
+    hideLoupe();
   };
+
   window.addEventListener('mousemove', move);
   window.addEventListener('mouseup', up);
 }
@@ -242,11 +418,12 @@ video.addEventListener('loadedmetadata', () => {
     updateInputs();
   }
   // videoWidth === 0 after metadata means the codec can't be decoded for preview.
+  framesCapable = !!video.videoWidth;        // gates the loupe's frame thumbnails
   if (!video.videoWidth) showPreviewFallback(); else hidePreviewFallback();
 });
 
 // Decode/codec failure (e.g. HEVC/HDR without OS support): trimming still works.
-video.addEventListener('error', showPreviewFallback);
+video.addEventListener('error', () => { framesCapable = false; showPreviewFallback(); });
 
 function showPreviewFallback() { if (previewFallback) previewFallback.classList.remove('hidden'); }
 function hidePreviewFallback() { if (previewFallback) previewFallback.classList.add('hidden'); }
@@ -299,20 +476,75 @@ const ffActions = $('ff-actions');
 const ffProgressWrap = $('ff-progress-wrap');
 const ffBar = $('ff-bar');
 const ffPct = $('ff-pct');
+const ffTitle = $('ff-title');
+const ffStatus = $('ff-status');
+const ffStatusText = $('ff-status-text');
+const ffPath = $('ff-path');
+const ffNote = $('ff-note');
+const ffDesc = $('ff-desc');
+const ffDoneBtn = $('ff-done');
+const ffDownloadBtn = $('ff-download');
+const ffPickBtn = $('ff-pick');
 
 let ffDownloading = false;
 function showFfmpegModal() { if (ffModal) ffModal.classList.remove('hidden'); }
 function hideFfmpegModal() { if (ffModal) ffModal.classList.add('hidden'); }
-// Reset to the action buttons (used when reopened from the ⋯ menu).
-function openFfmpegModal() {
+
+const FF_SOURCE_LABEL = {
+  bundled: '内置 ffmpeg（随应用打包）',
+  downloaded: '已下载的 ffmpeg（应用数据目录）',
+  system: '系统 ffmpeg'
+};
+
+// Populate the modal from the current ffmpeg state: when it's already available
+// show WHERE it comes from (no misleading "download needed" prompt); only when
+// it's genuinely missing do we lead with download / manual-pick.
+async function renderFfmpegModal() {
+  let info = { available: false, source: 'none' };
+  try { if (window.api.ffmpegInfo) info = await window.api.ffmpegInfo(); } catch (_) {}
+
+  if (info.available) {
+    ffTitle.textContent = 'ffmpeg 设置';
+    ffStatus.classList.remove('hidden', 'warn');
+    ffStatus.classList.add('ok');
+    ffStatusText.textContent = '正在使用：' + (FF_SOURCE_LABEL[info.source] || 'ffmpeg');
+    ffPath.textContent = info.ffmpeg || '';
+    ffNote.classList.toggle('hidden', !!info.ffprobe);
+    ffNote.textContent = info.ffprobe ? '' : '未找到 ffprobe —— 时长/分辨率会回退到解析 ffmpeg 输出。';
+    ffDesc.textContent = '已就绪，可直接裁剪导出。如需更换，可重新下载或指定其他 ffmpeg。';
+    ffDoneBtn.classList.remove('hidden');
+    ffDownloadBtn.textContent = '重新下载（约 40MB）';
+    ffDownloadBtn.classList.remove('btn-primary'); ffDownloadBtn.classList.add('btn-secondary');
+    ffPickBtn.textContent = '手动选择其他 ffmpeg…';
+  } else {
+    ffTitle.textContent = '需要 ffmpeg';
+    ffStatus.classList.remove('hidden', 'ok');
+    ffStatus.classList.add('warn');
+    ffStatusText.textContent = '未在系统 PATH 中找到 ffmpeg';
+    ffPath.textContent = '';
+    ffNote.classList.add('hidden');
+    ffDesc.textContent = '精简版不预置 ffmpeg。你可以自动下载，或手动指定一个已有的 ffmpeg 可执行文件。';
+    ffDoneBtn.classList.add('hidden');
+    ffDownloadBtn.textContent = '自动下载（约 40MB，仅一次）';
+    ffDownloadBtn.classList.remove('btn-secondary'); ffDownloadBtn.classList.add('btn-primary');
+    ffPickBtn.textContent = '手动选择 ffmpeg…';
+  }
+}
+
+// Reset to the actions view, refresh the status, then show. Used by both the
+// auto prompt (ffmpeg missing) and the ⋯ → 设置 ffmpeg… menu item.
+async function presentFfmpegModal() {
   ffActions.classList.remove('hidden');
   ffProgressWrap.classList.add('hidden');
+  await renderFfmpegModal();
   showFfmpegModal();
 }
-// The ffmpeg modal closes on backdrop click, but never mid-download.
+
+// The ffmpeg modal closes on backdrop click or 完成, but never mid-download.
 if (ffModal) ffModal.addEventListener('click', (e) => {
   if (e.target === ffModal && !ffDownloading) hideFfmpegModal();
 });
+if (ffDoneBtn) ffDoneBtn.addEventListener('click', hideFfmpegModal);
 
 function onFfmpegReady() {
   ffmpegReady = true;
@@ -329,11 +561,10 @@ function onFfmpegReady() {
   if (!window.api.ffmpegStatus) { onFfmpegReady(); return; } // no gate → ready
   window.api.ffmpegStatus().then((ok) => {
     if (ok) onFfmpegReady();
-    else showFfmpegModal();
-  }).catch(() => showFfmpegModal());
+    else presentFfmpegModal();
+  }).catch(() => presentFfmpegModal());
 })();
 
-const ffDownloadBtn = $('ff-download');
 if (ffDownloadBtn) ffDownloadBtn.addEventListener('click', async () => {
   ffActions.classList.add('hidden');
   ffProgressWrap.classList.remove('hidden');
@@ -358,7 +589,6 @@ if (ffDownloadBtn) ffDownloadBtn.addEventListener('click', async () => {
   }
 });
 
-const ffPickBtn = $('ff-pick');
 if (ffPickBtn) ffPickBtn.addEventListener('click', async () => {
   try {
     const ok = await window.api.pickAndSetFfmpeg();
@@ -435,7 +665,7 @@ advMenu.addEventListener('click', (e) => {
     case 'gif': openModal('gif-modal'); break;
     case 'stripAudio': performExport({ kind: 'stripAudio' }, { needChoice: true, msg: '正在移除音频…' }); break;
     case 'frame': performExport({ kind: 'frame', frameTime: video.currentTime, frameFormat: 'png' }, { msg: '正在导出当前帧…' }); break;
-    case 'ffmpeg': openFfmpegModal(); break;
+    case 'ffmpeg': presentFfmpegModal(); break;
   }
 });
 

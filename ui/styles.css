@@ -271,6 +271,51 @@ html, body {
   pointer-events: none; left: 0;
 }
 
+/* Handle "focus" feedback when fine-tuning (slow drag / dwell). */
+.handle.focusing {
+  box-shadow: 0 0 0 2px rgba(255, 204, 0, 0.55), 0 0 14px rgba(255, 204, 0, 0.75);
+}
+
+/* ---------- Precision frame loupe (floats above the dragged handle) ---------- */
+.loupe {
+  position: fixed; z-index: 95; width: 280px;
+  background: rgba(20, 20, 22, 0.97);
+  border: 1px solid #000; border-radius: 10px;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.6);
+  overflow: visible;
+  pointer-events: none;
+  opacity: 0; transform: translateY(4px) scale(0.96);
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+.loupe.show { opacity: 1; transform: translateY(0) scale(1); }
+.loupe-view { padding: 6px; background: #0d0d0d; border-radius: 9px 9px 0 0; }
+.loupe.no-frames .loupe-view { display: none; } /* codec can't decode → timecode only */
+.loupe-row { display: flex; gap: 2px; justify-content: center; align-items: center; }
+.loupe-tile { display: block; flex: 0 0 auto; background: #000; border-radius: 2px; }
+.loupe-tile.center {
+  border-radius: 3px;
+  outline: 2px solid var(--accent);
+  box-shadow: 0 0 8px rgba(255, 204, 0, 0.6);
+}
+.loupe-time {
+  display: block; text-align: center;
+  font-size: 14px; font-weight: 700; color: var(--accent);
+  font-variant-numeric: tabular-nums; letter-spacing: 0.3px;
+  padding: 6px 8px 0;
+}
+.loupe-hint {
+  display: block; text-align: center;
+  font-size: 10px; color: var(--text-dim);
+  padding: 2px 8px 7px;
+}
+.loupe-hint.fine { color: var(--accent); }
+.loupe-arrow {
+  position: absolute; bottom: -7px; width: 0; height: 0;
+  transform: translateX(-50%);
+  border-left: 7px solid transparent; border-right: 7px solid transparent;
+  border-top: 7px solid rgba(20, 20, 22, 0.97);
+}
+
 /* ---------- Meta row ---------- */
 .meta-row {
   display: flex; align-items: center; gap: 18px;
@@ -343,6 +388,20 @@ html, body {
 @keyframes qt-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
 
 /* ffmpeg setup modal */
+.ff-status {
+  background: var(--panel-2); border-radius: 8px;
+  padding: 10px 12px; margin-bottom: 14px;
+}
+.ff-status-line { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text); }
+.ff-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: var(--text-dim); }
+.ff-status.ok .ff-dot { background: #34c759; box-shadow: 0 0 6px rgba(52, 199, 89, 0.7); }
+.ff-status.warn .ff-dot { background: var(--accent); box-shadow: 0 0 6px rgba(255, 204, 0, 0.7); }
+.ff-path {
+  margin-top: 6px; font-size: 12px; color: var(--text-dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  word-break: break-all; user-select: text; cursor: text;
+}
+.ff-note { margin-top: 6px; font-size: 12px; color: var(--accent); }
 .ff-desc { font-size: 13px; color: var(--text-dim); line-height: 1.6; margin-bottom: 18px; }
 .ff-actions { display: flex; flex-direction: column; gap: 10px; }
 .ff-actions .btn-primary, .ff-actions .btn-secondary { width: 100%; padding: 11px; }
