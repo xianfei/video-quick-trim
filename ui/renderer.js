@@ -37,6 +37,18 @@ const MIN_GAP = 0.05;
 let ffmpegReady = false;       // Tauri: set once ffmpeg is found/installed
 let ffmpegMissing = false;     // Tauri: set once the status check confirms it's absent
 let pendingLoadPath = null;    // a file to load after ffmpeg becomes ready
+let currentInfo = null;        // probe result for the loaded file (shown in 高级设置)
+let pendingAutoplay = false;   // start playing once the next load has metadata
+
+// Persisted preferences (shared across windows via localStorage).
+const settings = {
+  preserveTimes: localStorage.getItem('qt.preserveTimes') === '1',
+  autoplay: localStorage.getItem('qt.autoplay') === '1'
+};
+function saveSetting(key, val) {
+  settings[key] = val;
+  try { localStorage.setItem('qt.' + key, val ? '1' : '0'); } catch (_) {}
+}
 
 // ---------- time helpers ----------
 const pad = (n) => String(n).padStart(2, '0');
@@ -77,7 +89,7 @@ function toast(msg, isError = false) {
 }
 
 // ---------- load a video ----------
-async function loadVideo(p) {
+async function loadVideo(p, autoplay = settings.autoplay) {
   // ffmpeg must be available before we can probe/preview (Tauri may need setup).
   // While the status check is still in flight, just queue — don't flash the
   // setup modal; only prompt once we KNOW ffmpeg is missing.
@@ -85,12 +97,14 @@ async function loadVideo(p) {
   try {
     const info = await window.api.probe(p);
     filePath = p;
+    currentInfo = info;
     duration = info.durationSec || 0;
     startT = 0;
     endT = duration;
 
     filenameEl.textContent = info.name;
     if (window.api.whenReady) await window.api.whenReady(); // media-server base ready (Tauri)
+    pendingAutoplay = !!autoplay;
     video.src = toMediaSrc(p);
     video.load();
     setCaptureSource(p); // hidden decoder that feeds the fine-tune loupe's neighbour frames
@@ -423,6 +437,11 @@ video.addEventListener('loadedmetadata', () => {
   // videoWidth === 0 after metadata means the codec can't be decoded for preview.
   framesCapable = !!video.videoWidth;        // gates the loupe's frame thumbnails
   if (!video.videoWidth) showPreviewFallback(); else hidePreviewFallback();
+  if (pendingAutoplay) {
+    pendingAutoplay = false;
+    video.currentTime = startT;
+    video.play().catch(() => {});
+  }
 });
 
 // Decode/codec failure (e.g. HEVC/HDR without OS support): trimming still works.
@@ -661,6 +680,10 @@ async function performExport(opts, { needChoice = false, msg = '正在导出…'
     target = choice;
   }
   opts.target = target;
+  // Preserve the source file's dates on the trimmed video (opt-in); not for
+  // frame/audio/gif, which are a different medium.
+  opts.preserveTimes = settings.preserveTimes &&
+    ['lossless', 'precise', 'reencode', 'stripAudio'].includes(opts.kind);
 
   overlayMsg.textContent = msg;
   progressBar.style.width = '0%';
@@ -683,7 +706,8 @@ async function performExport(opts, { needChoice = false, msg = '正在导出…'
     if (res && res.canceled) { overlay.classList.add('hidden'); if (isReplace) reattachVideo(resumeAt); return; }
     // Reload from outPath, not the old filePath — a container change writes a new
     // extension and removes the original, so filePath may no longer exist.
-    if (isReplace) await loadVideo((res && res.outPath) || filePath);
+    // Don't auto-play a just-exported result.
+    if (isReplace) await loadVideo((res && res.outPath) || filePath, false);
     overlay.classList.add('hidden');
     toast('已保存：' + (res.outPath || ''));
   } catch (err) {
@@ -722,9 +746,40 @@ advMenu.addEventListener('click', (e) => {
     case 'gif': openModal('gif-modal'); break;
     case 'stripAudio': performExport({ kind: 'stripAudio' }, { needChoice: true, msg: '正在移除音频…' }); break;
     case 'frame': performExport({ kind: 'frame', frameTime: video.currentTime, frameFormat: 'png' }, { msg: '正在导出当前帧…' }); break;
+    case 'settings': openSettingsModal(); break;
     case 'ffmpeg': presentFfmpegModal(); break;
   }
 });
+
+// ---------- advanced settings modal ----------
+function openSettingsModal() {
+  const el = $('set-fileinfo');
+  if (currentInfo && filePath) {
+    const i = currentInfo;
+    const res = (i.width && i.height) ? `${i.width}×${i.height}` : '';
+    const fps = i.fps ? `${Math.round(i.fps * 100) / 100} fps` : '';
+    const vLine = [i.vcodec || '—', res, fps].filter(Boolean).join(' · ');
+    el.innerHTML =
+      '<div class="set-fi-name"></div>' +
+      '<div class="set-fi-row"><span class="k">视频</span><span class="v"></span></div>' +
+      '<div class="set-fi-row"><span class="k">音频</span><span class="v"></span></div>' +
+      '<div class="set-fi-row"><span class="k">时长</span><span class="v"></span></div>' +
+      '<div class="set-fi-row"><span class="k">封装</span><span class="v"></span></div>';
+    el.querySelector('.set-fi-name').textContent = i.name || '';
+    const v = el.querySelectorAll('.set-fi-row .v');
+    v[0].textContent = vLine;
+    v[1].textContent = i.acodec || '无';
+    v[2].textContent = formatTime(i.durationSec || duration);
+    v[3].textContent = (i.ext || '').toUpperCase();
+  } else {
+    el.innerHTML = '<div class="set-fi-empty">未打开视频</div>';
+  }
+  $('set-preserve-times').checked = settings.preserveTimes;
+  $('set-autoplay').checked = settings.autoplay;
+  openModal('settings-modal');
+}
+$('set-preserve-times').addEventListener('change', (e) => saveSetting('preserveTimes', e.target.checked));
+$('set-autoplay').addEventListener('change', (e) => saveSetting('autoplay', e.target.checked));
 
 // ---------- modals ----------
 function openModal(id) { document.getElementById(id).classList.remove('hidden'); }

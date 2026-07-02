@@ -47,6 +47,8 @@
       <div class="adv-sep"></div>
       <button class="adv-item" data-act="stripAudio">移除音频（无损）</button>
       <button class="adv-item" data-act="frame">导出当前帧为图片</button>
+      <div class="adv-sep"></div>
+      <button class="adv-item" data-act="settings">高级设置…</button>
       <button class="adv-item hidden" data-act="ffmpeg" id="adv-ffmpeg">设置 ffmpeg…</button>
     </div>
 
@@ -243,6 +245,27 @@
         <div class="ff-progress-msg">正在下载 ffmpeg…</div>
         <div class="progress"><div id="ff-bar" class="progress-bar"></div></div>
         <div id="ff-pct" class="progress-pct">0%</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Advanced settings -->
+  <div id="settings-modal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-title">高级设置</div>
+      <div id="set-fileinfo" class="set-fileinfo"></div>
+      <div class="set-options">
+        <label class="set-check">
+          <input type="checkbox" id="set-preserve-times" />
+          <span>保持原文件的修改 / 创建日期</span>
+        </label>
+        <label class="set-check">
+          <input type="checkbox" id="set-autoplay" />
+          <span>打开文件后自动播放</span>
+        </label>
+      </div>
+      <div class="modal-actions">
+        <button class="btn-primary" data-close>完成</button>
       </div>
     </div>
   </div>

@@ -3,7 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 
 // Shared ffmpeg-arg logic (also used by the Tauri bridge) — single source of truth.
 const { buildArgs, outputExtFor, suffixFor, hmsToSeconds } = require('../ui/export-args.js');
@@ -126,7 +126,7 @@ app.on('window-all-closed', () => {
 
 function run(cmd, args) {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args);
+    const child = spawn(cmd, args, { windowsHide: true });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (d) => { stdout += d.toString(); });
@@ -152,16 +152,17 @@ function parseFfmpegInfo(stderr, filePath) {
   let durationSec = 0;
   const dm = stderr.match(/Duration:\s*([0-9:.]+)/);
   if (dm) durationSec = parseHms(dm[1]);
-  let width = 0, height = 0, vcodec = '', acodec = '';
+  let width = 0, height = 0, vcodec = '', acodec = '', fps = 0;
   const vLine = stderr.split('\n').find((l) => l.includes('Video:'));
   if (vLine) {
     const vm = vLine.match(/Video:\s*([^\s,(]+)/); if (vm) vcodec = vm[1];
     const rm = vLine.match(/(\d{2,5})x(\d{2,5})/); if (rm) { width = +rm[1]; height = +rm[2]; }
+    const fm = vLine.match(/([\d.]+)\s*fps/); if (fm) fps = parseFloat(fm[1]);
   }
   const aLine = stderr.split('\n').find((l) => l.includes('Audio:'));
   if (aLine) { const am = aLine.match(/Audio:\s*([^\s,(]+)/); if (am) acodec = am[1]; }
   return {
-    durationSec, width, height, vcodec, acodec,
+    durationSec, width, height, vcodec, acodec, fps,
     ext: path.extname(filePath).replace('.', '').toLowerCase(),
     name: path.basename(filePath)
   };
@@ -170,7 +171,7 @@ function parseFfmpegInfo(stderr, filePath) {
 // stderr — that's expected; capture stderr regardless of exit code.
 function ffmpegProbe(filePath) {
   return new Promise((resolve) => {
-    const child = spawn(ffmpegPath, ['-hide_banner', '-i', filePath]);
+    const child = spawn(ffmpegPath, ['-hide_banner', '-i', filePath], { windowsHide: true });
     let stderr = '';
     child.stderr.on('data', (d) => { stderr += d.toString(); });
     child.on('error', () => resolve(stderr));
@@ -201,12 +202,15 @@ ipcMain.handle('thumbnails', async (_evt, { filePath, count = 10, durationSec = 
     ];
     try {
       await run(ffmpegPath, args);
-      if (fs.existsSync(file)) out.push('file://' + file);
-      else out.push(null);
+      // Return a base64 data URL, not a file:// path — a raw Windows path
+      // (C:\...) makes a malformed file URL and shows a black filmstrip. This
+      // also matches the Tauri backend and lets us drop the temp files.
+      out.push(fs.existsSync(file) ? 'data:image/jpeg;base64,' + fs.readFileSync(file).toString('base64') : null);
     } catch (e) {
       out.push(null);
     }
   }
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {}
   return out;
 });
 
@@ -255,7 +259,7 @@ function encoderWorks(encoder) {
         '-hide_banner', '-loglevel', 'error',
         '-f', 'lavfi', '-i', 'color=c=black:s=256x256:r=5:d=0.2',
         '-frames:v', '3', '-c:v', encoder, '-f', 'null', '-'
-      ]);
+      ], { windowsHide: true });
     } catch (_) { return finish(false); }
     const t = setTimeout(() => { try { child.kill('SIGKILL'); } catch (_) {} finish(false); }, 12000);
     child.on('error', () => { clearTimeout(t); finish(false); });
@@ -289,7 +293,7 @@ ipcMain.handle('ffmpegInfo', () => ({
 
 function runFfmpegWithProgress(args, totalDur, evt) {
   return new Promise((resolve, reject) => {
-    const child = spawn(ffmpegPath, args);
+    const child = spawn(ffmpegPath, args, { windowsHide: true });
     let stderr = '';
     child.stderr.on('data', (d) => {
       const s = d.toString();
@@ -311,6 +315,29 @@ function runFfmpegWithProgress(args, totalDur, evt) {
 
 function safeUnlink(p) {
   try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch (_) {}
+}
+
+// Give `dest` the same modification and creation dates as the captured source
+// stat (opt-in "keep original dates"). mtime/atime are portable; creation time
+// is macOS/Windows-specific.
+function applyTimestamps(st, dest) {
+  const { atime, mtime } = st;
+  const birth = st.birthtimeMs > 0 && st.birthtime <= mtime ? st.birthtime : null;
+  try {
+    if (process.platform === 'darwin' && birth) {
+      // APFS pulls the creation date down to an earlier mtime, then keeps it when
+      // mtime is set later — so two utimes calls restore both exactly.
+      fs.utimesSync(dest, birth, birth);
+      fs.utimesSync(dest, atime, mtime);
+    } else {
+      fs.utimesSync(dest, atime, mtime);
+      if (process.platform === 'win32' && birth) {
+        spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command',
+          `$f=Get-Item -LiteralPath '${dest.replace(/'/g, "''")}'; $f.CreationTime=[DateTime]::Parse('${birth.toISOString()}')`],
+          { windowsHide: true, timeout: 10000 });
+      }
+    }
+  } catch (_) { /* best effort — never fail the export over a timestamp */ }
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -364,6 +391,10 @@ ipcMain.handle('exportClip', async (evt, opts) => {
   const base = path.basename(filePath, srcExt);
   const outExt = outputExtFor(opts);
 
+  // Capture the source's dates up front (before a replace overwrites/removes it).
+  let srcTimes = null;
+  if (opts.preserveTimes) { try { srcTimes = fs.statSync(filePath); } catch (_) {} }
+
   // Frame / audio / GIF produce inherently new files — replacing the source
   // makes no sense, so force "save as" for those.
   let target = opts.target;
@@ -402,6 +433,7 @@ ipcMain.handle('exportClip', async (evt, opts) => {
     if (target === 'replace' && path.resolve(finalPath) !== path.resolve(filePath)) {
       safeUnlink(filePath);
     }
+    if (srcTimes) applyTimestamps(srcTimes, finalPath);
     return { canceled: false, outPath: finalPath };
   } catch (err) {
     safeUnlink(tmpPath);

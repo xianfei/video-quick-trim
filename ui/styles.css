@@ -403,6 +403,23 @@ html, body {
 }
 .ff-note { margin-top: 6px; font-size: 12px; color: var(--accent); }
 .ff-desc { font-size: 13px; color: var(--text-dim); line-height: 1.6; margin-bottom: 18px; }
+
+/* ---------- Advanced settings modal ---------- */
+.set-fileinfo {
+  background: var(--panel-2); border-radius: 8px;
+  padding: 12px 14px; margin-bottom: 18px;
+}
+.set-fi-name {
+  font-size: 13px; font-weight: 600; color: var(--text);
+  margin-bottom: 8px; word-break: break-all;
+}
+.set-fi-row { display: flex; gap: 10px; font-size: 12.5px; line-height: 1.7; }
+.set-fi-row .k { flex: 0 0 auto; width: 40px; color: var(--text-dim); }
+.set-fi-row .v { color: var(--text); font-variant-numeric: tabular-nums; }
+.set-fi-empty { font-size: 13px; color: var(--text-dim); }
+.set-options { display: flex; flex-direction: column; gap: 14px; }
+.set-check { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--text); cursor: pointer; }
+.set-check input { accent-color: var(--accent); width: 15px; height: 15px; flex: 0 0 auto; }
 .ff-actions { display: flex; flex-direction: column; gap: 10px; }
 .ff-actions .btn-primary, .ff-actions .btn-secondary { width: 100%; padding: 11px; }
 .ff-progress { margin-top: 4px; }

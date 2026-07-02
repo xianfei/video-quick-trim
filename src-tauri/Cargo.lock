@@ -2632,6 +2632,7 @@ version = "1.2.0"
 dependencies = [
  "base64 0.22.1",
  "ffmpeg-sidecar",
+ "filetime",
  "serde",
  "serde_json",
  "tauri",

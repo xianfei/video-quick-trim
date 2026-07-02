@@ -17,6 +17,8 @@ tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
+# Preserve the source file's modification/creation dates on the trimmed output.
+filetime = "0.2"
 # Tauri build is intentionally Node-free; ffmpeg is resolved from PATH or
 # downloaded on demand (with the user's consent) instead of being bundled.
 ffmpeg-sidecar = "2"

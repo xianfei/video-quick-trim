@@ -101,7 +101,8 @@
         finalPath,
         originalPath: opts.filePath,
         isReplace: target === 'replace',
-        totalDur
+        totalDur,
+        preserveTimes: !!opts.preserveTimes
       });
       return { canceled: false, outPath };
     },

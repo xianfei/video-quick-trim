@@ -42,6 +42,7 @@ struct ProbeInfo {
     height: i64,
     vcodec: String,
     acodec: String,
+    fps: f64,
     ext: String,
     name: String,
 }
@@ -78,6 +79,19 @@ fn exe_name(base: &str) -> String {
     } else {
         base.to_string()
     }
+}
+
+// Build a Command for ffmpeg/ffprobe that doesn't flash a console window on
+// Windows (GUI apps otherwise pop a black cmd window for each spawn).
+fn tool_command<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
+    #[allow(unused_mut)]
+    let mut c = Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    c
 }
 
 // ---- local media server (range-capable, for large-video streaming) --------
@@ -417,7 +431,7 @@ async fn pick_and_set_ffmpeg(app: tauri::AppHandle) -> Result<bool, String> {
         Some(p) => PathBuf::from(p.to_string()),
         None => return Ok(false),
     };
-    let valid = Command::new(&path)
+    let valid = tool_command(&path)
         .arg("-version")
         .output()
         .map(|o| o.status.success())
@@ -457,15 +471,31 @@ fn parse_ffprobe_json(stdout: &[u8], path: &str) -> Result<ProbeInfo, String> {
     let streams = json["streams"].as_array().unwrap_or(&empty);
     let v = streams.iter().find(|s| s["codec_type"] == "video");
     let a = streams.iter().find(|s| s["codec_type"] == "audio");
+    let fps = v
+        .and_then(|s| s["avg_frame_rate"].as_str().or_else(|| s["r_frame_rate"].as_str()))
+        .map(parse_fraction)
+        .unwrap_or(0.0);
     Ok(ProbeInfo {
         duration_sec,
         width: v.and_then(|s| s["width"].as_i64()).unwrap_or(0),
         height: v.and_then(|s| s["height"].as_i64()).unwrap_or(0),
         vcodec: v.and_then(|s| s["codec_name"].as_str()).unwrap_or("").to_string(),
         acodec: a.and_then(|s| s["codec_name"].as_str()).unwrap_or("").to_string(),
+        fps,
         ext: ext_no_dot(path),
         name: file_name(path),
     })
+}
+
+// Parse ffprobe's "num/den" frame-rate strings (e.g. "30000/1001") into fps.
+fn parse_fraction(s: &str) -> f64 {
+    if let Some((n, d)) = s.split_once('/') {
+        let (n, d) = (n.trim().parse::<f64>().unwrap_or(0.0), d.trim().parse::<f64>().unwrap_or(0.0));
+        if d != 0.0 {
+            return n / d;
+        }
+    }
+    s.trim().parse().unwrap_or(0.0)
 }
 
 // Extract "WIDTHxHEIGHT" (e.g. 1920x1080) from an ffmpeg stream line.
@@ -495,7 +525,7 @@ fn parse_ffmpeg_info(stderr: &str, path: &str) -> ProbeInfo {
             .collect();
         duration = parse_hms(val.trim());
     }
-    let (mut w, mut h, mut vcodec, mut acodec) = (0i64, 0i64, String::new(), String::new());
+    let (mut w, mut h, mut vcodec, mut acodec, mut fps) = (0i64, 0i64, String::new(), String::new(), 0.0f64);
     for line in stderr.lines() {
         let l = line.trim();
         if vcodec.is_empty() {
@@ -510,6 +540,7 @@ fn parse_ffmpeg_info(stderr: &str, path: &str) -> ProbeInfo {
                     w = ww;
                     h = hh;
                 }
+                fps = parse_fps(l);
             }
         }
         if acodec.is_empty() {
@@ -529,19 +560,37 @@ fn parse_ffmpeg_info(stderr: &str, path: &str) -> ProbeInfo {
         height: h,
         vcodec,
         acodec,
+        fps,
         ext: ext_no_dot(path),
         name: file_name(path),
     }
+}
+
+// Extract "NN fps" (e.g. "29.97 fps") from an ffmpeg stream line.
+fn parse_fps(line: &str) -> f64 {
+    if let Some(i) = line.find(" fps") {
+        let num: String = line[..i]
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        return num.parse().unwrap_or(0.0);
+    }
+    0.0
 }
 
 #[tauri::command]
 async fn probe(app: tauri::AppHandle, path: String) -> Result<ProbeInfo, String> {
     let tools = require_tools(&app)?;
     if let Some(ffprobe) = &tools.ffprobe {
-        let out = Command::new(ffprobe)
+        let out = tool_command(ffprobe)
             .args([
                 "-v", "error",
-                "-show_entries", "format=duration:stream=codec_type,codec_name,width,height",
+                "-show_entries",
+                "format=duration:stream=codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate",
                 "-of", "json", &path,
             ])
             .output();
@@ -552,7 +601,7 @@ async fn probe(app: tauri::AppHandle, path: String) -> Result<ProbeInfo, String>
         }
         // fall through to ffmpeg-based parsing on any failure
     }
-    let out = Command::new(&tools.ffmpeg)
+    let out = tool_command(&tools.ffmpeg)
         .args(["-hide_banner", "-i", &path])
         .output()
         .map_err(|e| e.to_string())?;
@@ -581,7 +630,7 @@ async fn thumbnails(
         };
         let file = dir.join(format!("thumb-{}.jpg", i));
         let file_str = file.to_string_lossy().to_string();
-        let res = Command::new(&tools.ffmpeg)
+        let res = tool_command(&tools.ffmpeg)
             .args([
                 "-ss", &t.to_string(), "-i", &path, "-frames:v", "1",
                 "-vf", "scale=160:-1", "-q:v", "5", "-y", &file_str,
@@ -632,7 +681,7 @@ fn hw_candidates() -> Vec<HwEnc> {
 }
 
 fn encoder_works(ffmpeg: &Path, enc: &str) -> bool {
-    Command::new(ffmpeg)
+    tool_command(ffmpeg)
         .args([
             "-hide_banner", "-loglevel", "error", "-f", "lavfi",
             "-i", "color=c=black:s=256x256:r=5:d=0.2", "-frames:v", "3",
@@ -690,6 +739,20 @@ fn move_into(tmp: &str, final_path: &str) -> Result<(), String> {
     Ok(())
 }
 
+// Give `dest` the same modification (and, where possible, creation) dates as the
+// captured source metadata. Best effort — never fails the export.
+fn preserve_file_times(dest: &str, meta: &std::fs::Metadata) {
+    let mtime = filetime::FileTime::from_last_modification_time(meta);
+    let atime = filetime::FileTime::from_last_access_time(meta);
+    // macOS: setting an earlier mtime pulls the creation date down; APFS then
+    // keeps it when mtime is set later — two calls restore both exactly.
+    #[cfg(target_os = "macos")]
+    if let Ok(created) = meta.created() {
+        let _ = filetime::set_file_mtime(dest, filetime::FileTime::from_system_time(created));
+    }
+    let _ = filetime::set_file_times(dest, atime, mtime);
+}
+
 #[tauri::command]
 async fn run_export(
     app: tauri::AppHandle,
@@ -699,13 +762,20 @@ async fn run_export(
     original_path: String,
     is_replace: bool,
     total_dur: f64,
+    preserve_times: bool,
 ) -> Result<String, String> {
     let tools = require_tools(&app)?;
+    // Capture the source's dates before a replace overwrites/removes it.
+    let src_meta = if preserve_times {
+        std::fs::metadata(&original_path).ok()
+    } else {
+        None
+    };
     // Prepend newline-terminated progress so we can stream percentages reliably.
     let mut full: Vec<String> = vec!["-progress".into(), "pipe:2".into()];
     full.extend(args);
 
-    let mut child = Command::new(&tools.ffmpeg)
+    let mut child = tool_command(&tools.ffmpeg)
         .args(&full)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -742,6 +812,9 @@ async fn run_export(
     move_into(&tmp_path, &final_path)?;
     if is_replace && Path::new(&final_path) != Path::new(&original_path) {
         let _ = std::fs::remove_file(&original_path);
+    }
+    if let Some(meta) = &src_meta {
+        preserve_file_times(&final_path, meta);
     }
     Ok(final_path)
 }
