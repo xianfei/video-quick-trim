@@ -35,6 +35,7 @@ let startT = 0;
 let endT = 0;
 const MIN_GAP = 0.05;
 let ffmpegReady = false;       // Tauri: set once ffmpeg is found/installed
+let ffmpegMissing = false;     // Tauri: set once the status check confirms it's absent
 let pendingLoadPath = null;    // a file to load after ffmpeg becomes ready
 
 // ---------- time helpers ----------
@@ -78,7 +79,9 @@ function toast(msg, isError = false) {
 // ---------- load a video ----------
 async function loadVideo(p) {
   // ffmpeg must be available before we can probe/preview (Tauri may need setup).
-  if (!ffmpegReady) { pendingLoadPath = p; presentFfmpegModal(); return; }
+  // While the status check is still in flight, just queue — don't flash the
+  // setup modal; only prompt once we KNOW ffmpeg is missing.
+  if (!ffmpegReady) { pendingLoadPath = p; if (ffmpegMissing) presentFfmpegModal(); return; }
   try {
     const info = await window.api.probe(p);
     filePath = p;
@@ -548,6 +551,7 @@ if (ffDoneBtn) ffDoneBtn.addEventListener('click', hideFfmpegModal);
 
 function onFfmpegReady() {
   ffmpegReady = true;
+  ffmpegMissing = false;
   hideFfmpegModal();
   loadHwEncoders();
   // "设置 ffmpeg…" is only meaningful where ffmpeg isn't bundled (Tauri).
@@ -561,8 +565,8 @@ function onFfmpegReady() {
   if (!window.api.ffmpegStatus) { onFfmpegReady(); return; } // no gate → ready
   window.api.ffmpegStatus().then((ok) => {
     if (ok) onFfmpegReady();
-    else presentFfmpegModal();
-  }).catch(() => presentFfmpegModal());
+    else { ffmpegMissing = true; presentFfmpegModal(); }
+  }).catch(() => { ffmpegMissing = true; presentFfmpegModal(); });
 })();
 
 if (ffDownloadBtn) ffDownloadBtn.addEventListener('click', async () => {

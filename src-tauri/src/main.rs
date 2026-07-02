@@ -1,8 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use base64::Engine;
@@ -13,8 +15,14 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
 const VIDEO_EXTS: [&str; 9] = ["mp4", "mov", "mkv", "m4v", "avi", "webm", "ts", "flv", "wmv"];
 
-// A file the app was launched/opened with, awaiting the frontend to pick it up.
-struct PendingOpen(Mutex<Option<String>>);
+// Files awaiting pickup, keyed by the target window's label. Each window pulls
+// its own on startup (take_pending_open), so opening a second file lands in its
+// own window instead of clobbering another.
+struct PendingOpen(Mutex<HashMap<String, String>>);
+// Whether the first opened file has already been routed to the main window.
+struct FirstFile(AtomicBool);
+// Monotonic counter for labelling runtime-created windows.
+struct WindowSeq(AtomicUsize);
 
 // Resolved ffmpeg/ffprobe paths (cached after first resolution).
 #[derive(Default)]
@@ -780,15 +788,74 @@ async fn save_choice(app: tauri::AppHandle) -> String {
     }
 }
 
+// Each window pulls the file destined for it (by its own label) on startup.
 #[tauri::command]
-fn take_pending_open(state: State<PendingOpen>) -> Option<String> {
-    state.0.lock().unwrap().take()
+fn take_pending_open(window: tauri::WebviewWindow, state: State<PendingOpen>) -> Option<String> {
+    state.0.lock().unwrap().remove(window.label())
+}
+
+// Build a fresh editor window matching the config-defined main window's look.
+// The custom title-bar options are macOS-only (Windows/Linux use the default
+// decorations, exactly like the config window does there).
+fn build_window(app: &tauri::AppHandle, label: &str) -> tauri::Result<tauri::WebviewWindow> {
+    #[allow(unused_mut)]
+    let mut b = tauri::WebviewWindowBuilder::new(app, label, tauri::WebviewUrl::App("index.html".into()))
+        .title("Quick Trim")
+        .inner_size(1100.0, 720.0)
+        .min_inner_size(720.0, 520.0)
+        .theme(Some(tauri::Theme::Dark));
+    #[cfg(target_os = "macos")]
+    {
+        b = b
+            .title_bar_style(tauri::TitleBarStyle::Overlay)
+            .hidden_title(true)
+            .traffic_light_position(tauri::LogicalPosition::new(12.0, 27.0));
+    }
+    b.build()
+}
+
+// Route an opened file: the first one loads in the main window; every file
+// opened while the app is already running gets its own new window.
+fn deliver_file(app: &tauri::AppHandle, path: String) {
+    let first = !app.state::<FirstFile>().0.swap(true, Ordering::SeqCst);
+    if first {
+        app.state::<PendingOpen>()
+            .0
+            .lock()
+            .unwrap()
+            .insert("main".into(), path.clone());
+        let _ = app.emit("open-file", path); // main is the only window when this fires
+    } else {
+        let n = app.state::<WindowSeq>().0.fetch_add(1, Ordering::SeqCst);
+        let label = format!("win-{n}");
+        app.state::<PendingOpen>()
+            .0
+            .lock()
+            .unwrap()
+            .insert(label.clone(), path);
+        if let Err(e) = build_window(app, &label) {
+            eprintln!("Quick Trim: failed to open window: {e}");
+        }
+    }
 }
 
 fn main() {
     tauri::Builder::default()
+        // Single-instance FIRST: on Windows/Linux a second launch routes its file
+        // into this process (→ a new window) instead of spawning a new process.
+        // (macOS delivers subsequent files via the Opened event below.)
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if let Some(f) = argv
+                .iter()
+                .find(|a| !a.starts_with('-') && is_video(a) && Path::new(a).exists())
+            {
+                deliver_file(app, f.clone());
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
-        .manage(PendingOpen(Mutex::new(None)))
+        .manage(PendingOpen(Mutex::new(HashMap::new())))
+        .manage(FirstFile(AtomicBool::new(false)))
+        .manage(WindowSeq(AtomicUsize::new(1)))
         .manage(ToolsState::default())
         .manage(MediaBase(start_media_server()))
         .setup(|app| {
@@ -798,7 +865,7 @@ fn main() {
                 .iter()
                 .find(|a| !a.starts_with('-') && is_video(a) && Path::new(a).exists())
             {
-                *app.state::<PendingOpen>().0.lock().unwrap() = Some(f.clone());
+                deliver_file(app.handle(), f.clone());
             }
             Ok(())
         })
@@ -810,18 +877,15 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building Quick Trim")
         .run(|_app, _event| {
-            // macOS delivers "Open With" / double-click as an Opened event.
-            // (Windows/Linux receive the file via argv — handled in setup().)
+            // macOS delivers "Open With" / double-click as an Opened event — the
+            // first file loads in the main window, later ones open new windows.
+            // (Windows/Linux receive the file via argv / single-instance.)
             // RunEvent::Opened only exists on macOS, so gate it out elsewhere.
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Opened { urls } = _event {
                 for url in urls {
                     if let Ok(p) = url.to_file_path() {
-                        let s = p.to_string_lossy().to_string();
-                        if let Some(state) = _app.try_state::<PendingOpen>() {
-                            *state.0.lock().unwrap() = Some(s.clone());
-                        }
-                        let _ = _app.emit("open-file", s);
+                        deliver_file(_app, p.to_string_lossy().to_string());
                     }
                 }
             }

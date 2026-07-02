@@ -1,6 +1,6 @@
 [package]
 name = "quick-trim"
-version = "1.1.0"
+version = "1.2.0"
 description = "极简无损视频裁剪工具 (Quick Trim)"
 edition = "2021"
 rust-version = "1.77"
@@ -11,6 +11,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
+# Windows/Linux: route a second launch into the running process so the file
+# opens in a new window instead of a new process (macOS uses the Opened event).
+tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
