@@ -19,8 +19,9 @@ const ffmpegPath = unpacked(require('ffmpeg-static'));
 // Metadata (duration/resolution/codecs) is read from `ffmpeg -i` output, so we
 // ship only ffmpeg — no separate ffprobe binary to bundle.
 
-let mainWindow = null;
-let pendingOpenPath = null; // a file to load once the window is ready
+// Files waiting for a window (queued before the app is ready at launch). Each
+// opens in its OWN window — a second "Open With" never clobbers the first video.
+let pendingOpenPaths = [];
 
 // ---- single instance + "open with" handling --------------------------------
 
@@ -32,31 +33,29 @@ function fileFromArgv(argv) {
   return f && fs.existsSync(f) ? f : null;
 }
 
-function sendOpen(filePath) {
-  if (mainWindow && mainWindow.webContents) mainWindow.webContents.send('open-file', filePath);
-}
-
-// macOS delivers "Open With" / dock-drop via the open-file event.
+// macOS delivers "Open With" / dock-drop / double-click via open-file — open
+// each file in its own window (queued until the app is ready at launch).
 app.on('open-file', (event, filePath) => {
   event.preventDefault();
-  if (mainWindow) { sendOpen(filePath); if (mainWindow.isMinimized()) mainWindow.restore(); mainWindow.focus(); }
-  else pendingOpenPath = filePath;
+  if (app.isReady()) createWindow(filePath);
+  else pendingOpenPaths.push(filePath);
 });
 
-// Windows/Linux pass the path as argv; keep a single instance so double-opening
-// a file routes to the existing window.
+// Windows/Linux pass the path as argv; a single instance keeps one process, and
+// a second launch opens its file in a NEW window rather than a second process.
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
   app.on('second-instance', (_e, argv) => {
     const f = fileFromArgv(argv);
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.focus();
-      if (f) sendOpen(f);
-    }
+    if (f) { createWindow(f); return; }
+    // Relaunched without a file → just surface an existing window.
+    const wins = BrowserWindow.getAllWindows();
+    if (wins.length) { const w = wins[wins.length - 1]; if (w.isMinimized()) w.restore(); w.focus(); }
+    else createWindow(null);
   });
-  pendingOpenPath = pendingOpenPath || fileFromArgv(process.argv);
+  const initial = fileFromArgv(process.argv);
+  if (initial) pendingOpenPaths.push(initial);
 }
 
 // Surface a clear error if the bundled binary is missing (packaging mistake)
@@ -70,8 +69,10 @@ function checkBinaries() {
   }
 }
 
-function createWindow() {
-  mainWindow = new BrowserWindow({
+// Create a window; if `filePath` is given, load it once the UI is ready. New
+// windows cascade off the current one so stacked windows stay distinguishable.
+function createWindow(filePath) {
+  const opts = {
     width: 1100,
     height: 720,
     minWidth: 720,
@@ -94,24 +95,26 @@ function createWindow() {
       nodeIntegration: false,
       sandbox: false
     }
-  });
+  };
+  const ref = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows().slice(-1)[0];
+  if (ref && !ref.isDestroyed()) { const [x, y] = ref.getPosition(); opts.x = x + 30; opts.y = y + 30; }
 
-  mainWindow.loadFile(path.join(__dirname, '..', 'ui', 'index.html'));
-  mainWindow.on('closed', () => { mainWindow = null; });
-
-  // Once the UI is ready, load any file the app was launched/opened with.
-  mainWindow.webContents.on('did-finish-load', () => {
-    if (pendingOpenPath) { sendOpen(pendingOpenPath); pendingOpenPath = null; }
+  const win = new BrowserWindow(opts);
+  win.loadFile(path.join(__dirname, '..', 'ui', 'index.html'));
+  win.webContents.on('did-finish-load', () => {
+    if (filePath) win.webContents.send('open-file', filePath);
   });
+  return win;
 }
 
 app.whenReady().then(() => {
   nativeTheme.themeSource = 'dark'; // force dark native UI (menus, scrollbars, <select>/range controls)
   checkBinaries();
   detectHwEncoders(); // warm the cache so the re-encode modal is instant
-  createWindow();
+  if (pendingOpenPaths.length) { pendingOpenPaths.forEach((p) => createWindow(p)); pendingOpenPaths = []; }
+  else createWindow(null);
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    if (BrowserWindow.getAllWindows().length === 0) createWindow(null);
   });
 });
 
@@ -310,13 +313,29 @@ function safeUnlink(p) {
   try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch (_) {}
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Rename with a few retries: on Windows the destination can be transiently locked
+// (media-handle teardown, antivirus, Search indexer) → EPERM/EBUSY. Back off and
+// retry rather than fail the whole export.
+async function renameWithRetry(from, to, attempts = 6) {
+  for (let i = 0; ; i++) {
+    try { fs.renameSync(from, to); return; }
+    catch (err) {
+      if ((err.code === 'EPERM' || err.code === 'EBUSY') && i < attempts) { await sleep(150); continue; }
+      throw err;
+    }
+  }
+}
+
 // Move tmpPath onto finalPath, as close to atomic as the destination allows,
 // cleaning up partial files on any failure.
-function moveInto(tmpPath, finalPath) {
+async function moveInto(tmpPath, finalPath) {
   try {
-    fs.renameSync(tmpPath, finalPath); // atomic on the same volume
+    await renameWithRetry(tmpPath, finalPath); // atomic on the same volume
     return;
-  } catch (_) {
+  } catch (err) {
+    if (err.code !== 'EXDEV') throw err; // only a genuine cross-volume move needs a copy
     // Cross-volume: copy to a temp ON the destination volume, then atomic rename.
     const destTmp = path.join(
       path.dirname(finalPath),
@@ -324,10 +343,10 @@ function moveInto(tmpPath, finalPath) {
     );
     try {
       fs.copyFileSync(tmpPath, destTmp);
-      fs.renameSync(destTmp, finalPath);
-    } catch (err) {
+      await renameWithRetry(destTmp, finalPath);
+    } catch (e) {
       safeUnlink(destTmp);
-      throw err;
+      throw e;
     } finally {
       safeUnlink(tmpPath);
     }
@@ -352,7 +371,7 @@ ipcMain.handle('exportClip', async (evt, opts) => {
 
   let finalPath;
   if (target === 'saveAs') {
-    const res = await dialog.showSaveDialog(mainWindow, {
+    const res = await dialog.showSaveDialog(BrowserWindow.fromWebContents(evt.sender), {
       title: '导出',
       defaultPath: path.join(dir, `${base}${suffixFor(kind)}${outExt}`),
       filters: [{ name: '文件', extensions: [outExt.replace('.', '') || 'mp4'] }]
@@ -378,7 +397,7 @@ ipcMain.handle('exportClip', async (evt, opts) => {
 
   try {
     await runFfmpegWithProgress(args, kind === 'frame' ? 0 : totalDur, evt);
-    moveInto(tmpPath, finalPath);
+    await moveInto(tmpPath, finalPath);
     // Replacing with a changed container: drop the now-stale original.
     if (target === 'replace' && path.resolve(finalPath) !== path.resolve(filePath)) {
       safeUnlink(filePath);
@@ -392,8 +411,8 @@ ipcMain.handle('exportClip', async (evt, opts) => {
 
 // ---- IPC: open dialog -------------------------------------------------------
 
-ipcMain.handle('openDialog', async () => {
-  const res = await dialog.showOpenDialog(mainWindow, {
+ipcMain.handle('openDialog', async (evt) => {
+  const res = await dialog.showOpenDialog(BrowserWindow.fromWebContents(evt.sender), {
     title: '打开视频',
     properties: ['openFile'],
     filters: [
@@ -406,8 +425,8 @@ ipcMain.handle('openDialog', async () => {
 
 // ---- IPC: confirm dialog (save choice) -------------------------------------
 
-ipcMain.handle('saveChoice', async () => {
-  const res = await dialog.showMessageBox(mainWindow, {
+ipcMain.handle('saveChoice', async (evt) => {
+  const res = await dialog.showMessageBox(BrowserWindow.fromWebContents(evt.sender), {
     type: 'question',
     buttons: ['替换原文件', '另存为', '取消'],
     defaultId: 1,

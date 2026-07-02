@@ -599,6 +599,49 @@ if (ffPickBtn) ffPickBtn.addEventListener('click', async () => {
 });
 
 // ---------- export ----------
+
+// Release the OS file handles the preview + hidden capture decoder hold on the
+// current file, so it can be safely overwritten. Windows refuses to replace an
+// open file (EPERM); this also stops the preview from showing stale content
+// after the file changes. Resolves once both elements have emptied.
+function releaseVideoFiles() {
+  const empty = (el) => new Promise((resolve) => {
+    if (!el || (!el.getAttribute('src') && !el.currentSrc)) return resolve();
+    const done = () => { el.removeEventListener('emptied', done); resolve(); };
+    el.addEventListener('emptied', done);
+    try { el.pause(); } catch (_) {}
+    el.removeAttribute('src');
+    el.load();
+    setTimeout(done, 300); // fallback if 'emptied' never fires
+  });
+  return Promise.all([empty(video), empty(capVideo)]);
+}
+
+// Re-point the preview at the current file and restore the playhead — used after
+// a failed/cancelled replace, where the original is left untouched.
+function reattachVideo(seekTo) {
+  if (!filePath) return;
+  video.src = toMediaSrc(filePath);
+  video.load();
+  setCaptureSource(filePath);
+  const onMeta = () => {
+    video.removeEventListener('loadedmetadata', onMeta);
+    try { video.currentTime = Math.max(0, Math.min(seekTo || 0, (video.duration || duration) - 0.05)); } catch (_) {}
+  };
+  video.addEventListener('loadedmetadata', onMeta);
+}
+
+function exportErrorMessage(err) {
+  const m = (err && err.message) ? err.message : String(err);
+  if (/ENOSPC|no space|not enough space|disk full/i.test(m)) {
+    return '磁盘空间不足，无法写入导出文件。请清理磁盘，或用「另存为」保存到有空间的磁盘。';
+  }
+  if (/EPERM|EBUSY|being used|access is denied|permission denied/i.test(m)) {
+    return '无法覆盖原文件：文件可能被其他程序占用，请关闭后重试。';
+  }
+  return '导出失败：' + m;
+}
+
 // Single entry point for every export kind. opts.filePath/start/end are filled
 // from current state; needChoice asks replace-vs-saveAs first.
 async function performExport(opts, { needChoice = false, msg = '正在导出…' } = {}) {
@@ -624,16 +667,26 @@ async function performExport(opts, { needChoice = false, msg = '正在导出…'
     progressPct.textContent = pct.toFixed(0) + '%';
   });
 
+  // Replacing the original: free the file first (else Windows blocks the
+  // overwrite), then reload the trimmed result afterwards.
+  const isReplace = target === 'replace';
+  const resumeAt = video.currentTime;
+  if (isReplace) await releaseVideoFiles();
+
   try {
     const res = await window.api.exportClip(opts);
     off();
+    if (res && res.canceled) { overlay.classList.add('hidden'); if (isReplace) reattachVideo(resumeAt); return; }
+    // Reload from outPath, not the old filePath — a container change writes a new
+    // extension and removes the original, so filePath may no longer exist.
+    if (isReplace) await loadVideo((res && res.outPath) || filePath);
     overlay.classList.add('hidden');
-    if (res && res.canceled) return;
     toast('已保存：' + (res.outPath || ''));
   } catch (err) {
     off();
     overlay.classList.add('hidden');
-    toast('导出失败：' + err.message, true);
+    if (isReplace) reattachVideo(resumeAt); // original is intact on failure — restore the preview
+    toast(exportErrorMessage(err), true);
   }
 }
 

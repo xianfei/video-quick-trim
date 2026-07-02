@@ -659,6 +659,29 @@ fn parse_progress_time(s: &str) -> Option<f64> {
     Some(h * 3600.0 + m * 60.0 + sec)
 }
 
+// Move temp -> final. Retries rename on transient locks (Windows: media-handle
+// teardown, antivirus, Search indexer) before falling back to a copy — which
+// also covers a genuine cross-volume move.
+fn move_into(tmp: &str, final_path: &str) -> Result<(), String> {
+    for i in 0..6 {
+        match std::fs::rename(tmp, final_path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let transient = e.kind() == std::io::ErrorKind::PermissionDenied
+                    || matches!(e.raw_os_error(), Some(5) | Some(32)); // Win ACCESS_DENIED / SHARING_VIOLATION
+                if transient && i < 5 {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    std::fs::copy(tmp, final_path).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(tmp);
+    Ok(())
+}
+
 #[tauri::command]
 async fn run_export(
     app: tauri::AppHandle,
@@ -707,11 +730,8 @@ async fn run_export(
         return Err(format!("ffmpeg 退出码 {:?}\n{}", status.code(), tail));
     }
 
-    // Move temp -> final (rename; fall back to copy across volumes).
-    if std::fs::rename(&tmp_path, &final_path).is_err() {
-        std::fs::copy(&tmp_path, &final_path).map_err(|e| e.to_string())?;
-        let _ = std::fs::remove_file(&tmp_path);
-    }
+    // Move temp -> final: retry transient locks, else copy across volumes.
+    move_into(&tmp_path, &final_path)?;
     if is_replace && Path::new(&final_path) != Path::new(&original_path) {
         let _ = std::fs::remove_file(&original_path);
     }
