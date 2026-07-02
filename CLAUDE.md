@@ -9,7 +9,7 @@ Quick Trim — a minimal, Quick-Look-style **lossless video trimmer**. The same 
 ## Commands
 
 ```bash
-npm install                 # deps for the Electron build (+ @tauri-apps/cli, ffmpeg-static, @ffprobe-installer)
+npm install                 # deps for the Electron build (+ @tauri-apps/cli, ffmpeg-static)
 
 # Electron
 npm start                   # run
@@ -59,8 +59,8 @@ Note the export flow differs by backend: in Electron, `exportClip(opts)` is one 
 - **`RunEvent::Opened` is macOS-only** — gate it with `#[cfg(target_os = "macos")]` or the Windows/Linux build fails (E0599). Windows/Linux get the opened file via argv (handled in `setup()`).
 
 **Electron**
-- **ffprobe comes from `@ffprobe-installer/ffprobe`, not `ffprobe-static`** — the latter mislabels an x86_64 binary as arm64 (forces Rosetta, flags the app as Intel). ffmpeg is `ffmpeg-static`.
-- Bundled binaries are unpacked via `asarUnpack`; `main.js` rewrites `app.asar` → `app.asar.unpacked` at runtime.
+- **Only ffmpeg is bundled (`ffmpeg-static`) — no ffprobe.** `probe` parses metadata (duration/resolution/codecs) out of `ffmpeg -i` stderr (`parseFfmpegInfo` in `main.js`), the same approach the Tauri backend uses, so no separate ffprobe binary is shipped (~17MB smaller). Don't reintroduce `ffprobe-static` — it mislabels an x86_64 binary as arm64 (forces Rosetta, flags the app as Intel).
+- The ffmpeg binary is unpacked via `asarUnpack`; `main.js` rewrites `app.asar` → `app.asar.unpacked` at runtime.
 
 **Shared UI**
 - **The `<meta>` CSP in `ui/index.html` is a union for both backends.** It must keep `file:` (Electron media), `ipc://localhost`/`http://ipc.localhost` (Tauri IPC), and `http://127.0.0.1:*` / `http://localhost:*` (Tauri media server) in the right directives, or one backend silently breaks. Tauri's own CSP is `null` so only this meta tag applies there.

@@ -10,15 +10,14 @@ const { buildArgs, outputExtFor, suffixFor, hmsToSeconds } = require('../ui/expo
 
 const VIDEO_EXTS = ['mp4', 'mov', 'mkv', 'm4v', 'avi', 'webm', 'ts', 'flv', 'wmv'];
 
-// Resolve bundled ffmpeg / ffprobe binaries. In a packaged app the binaries
-// live inside app.asar.unpacked (configured via build.asarUnpack).
+// Resolve the bundled ffmpeg binary. In a packaged app it lives inside
+// app.asar.unpacked (configured via build.asarUnpack).
 function unpacked(p) {
   return p ? p.replace('app.asar', 'app.asar.unpacked') : p;
 }
 const ffmpegPath = unpacked(require('ffmpeg-static'));
-// @ffprobe-installer ships a genuine per-arch binary (ffprobe-static mislabels an
-// x86_64 build as arm64, which forces Rosetta and flags the app as Intel).
-const ffprobePath = unpacked(require('@ffprobe-installer/ffprobe').path);
+// Metadata (duration/resolution/codecs) is read from `ffmpeg -i` output, so we
+// ship only ffmpeg — no separate ffprobe binary to bundle.
 
 let mainWindow = null;
 let pendingOpenPath = null; // a file to load once the window is ready
@@ -60,16 +59,14 @@ if (!app.requestSingleInstanceLock()) {
   pendingOpenPath = pendingOpenPath || fileFromArgv(process.argv);
 }
 
-// Surface a clear error if the bundled binaries are missing (packaging mistake)
+// Surface a clear error if the bundled binary is missing (packaging mistake)
 // instead of failing later with an opaque ENOENT.
 function checkBinaries() {
-  for (const [name, p] of [['ffmpeg', ffmpegPath], ['ffprobe', ffprobePath]]) {
-    if (!p || !fs.existsSync(p)) {
-      dialog.showErrorBox(
-        'Quick Trim 启动错误',
-        `找不到 ${name} 可执行文件：\n${p}\n\n这通常是打包问题（asarUnpack 未匹配）。请重新安装应用。`
-      );
-    }
+  if (!ffmpegPath || !fs.existsSync(ffmpegPath)) {
+    dialog.showErrorBox(
+      'Quick Trim 启动错误',
+      `找不到 ffmpeg 可执行文件：\n${ffmpegPath}\n\n这通常是打包问题（asarUnpack 未匹配）。请重新安装应用。`
+    );
   }
 }
 
@@ -141,28 +138,44 @@ function run(cmd, args) {
 
 // ---- IPC: probe -------------------------------------------------------------
 
-ipcMain.handle('probe', async (_evt, filePath) => {
-  const args = [
-    '-v', 'error',
-    '-show_entries', 'format=duration:stream=codec_type,codec_name,width,height',
-    '-of', 'json',
-    filePath
-  ];
-  const { stdout } = await run(ffprobePath, args);
-  const info = JSON.parse(stdout);
-  const streams = info.streams || [];
-  const v = streams.find((s) => s.codec_type === 'video') || {};
-  const a = streams.find((s) => s.codec_type === 'audio') || {};
+// Parse metadata out of `ffmpeg -i` stderr — the same approach the Tauri backend
+// uses when ffprobe is absent, so no separate ffprobe binary is needed.
+function parseHms(s) {
+  const parts = String(s).trim().split(':');
+  if (parts.length === 3) return (+parts[0] || 0) * 3600 + (+parts[1] || 0) * 60 + (parseFloat(parts[2]) || 0);
+  return parseFloat(s) || 0;
+}
+function parseFfmpegInfo(stderr, filePath) {
+  let durationSec = 0;
+  const dm = stderr.match(/Duration:\s*([0-9:.]+)/);
+  if (dm) durationSec = parseHms(dm[1]);
+  let width = 0, height = 0, vcodec = '', acodec = '';
+  const vLine = stderr.split('\n').find((l) => l.includes('Video:'));
+  if (vLine) {
+    const vm = vLine.match(/Video:\s*([^\s,(]+)/); if (vm) vcodec = vm[1];
+    const rm = vLine.match(/(\d{2,5})x(\d{2,5})/); if (rm) { width = +rm[1]; height = +rm[2]; }
+  }
+  const aLine = stderr.split('\n').find((l) => l.includes('Audio:'));
+  if (aLine) { const am = aLine.match(/Audio:\s*([^\s,(]+)/); if (am) acodec = am[1]; }
   return {
-    durationSec: parseFloat(info.format && info.format.duration) || 0,
-    width: v.width || 0,
-    height: v.height || 0,
-    vcodec: v.codec_name || '',
-    acodec: a.codec_name || '',
+    durationSec, width, height, vcodec, acodec,
     ext: path.extname(filePath).replace('.', '').toLowerCase(),
     name: path.basename(filePath)
   };
-});
+}
+// `ffmpeg -i` with no output file exits non-zero but prints stream info to
+// stderr — that's expected; capture stderr regardless of exit code.
+function ffmpegProbe(filePath) {
+  return new Promise((resolve) => {
+    const child = spawn(ffmpegPath, ['-hide_banner', '-i', filePath]);
+    let stderr = '';
+    child.stderr.on('data', (d) => { stderr += d.toString(); });
+    child.on('error', () => resolve(stderr));
+    child.on('close', () => resolve(stderr));
+  });
+}
+
+ipcMain.handle('probe', async (_evt, filePath) => parseFfmpegInfo(await ffmpegProbe(filePath), filePath));
 
 // ---- IPC: thumbnails --------------------------------------------------------
 
@@ -263,11 +276,11 @@ function detectHwEncoders() {
 
 ipcMain.handle('hwEncoders', () => detectHwEncoders());
 
-// Electron ships ffmpeg/ffprobe inside the app — report them for the setup modal.
+// Electron ships ffmpeg inside the app (metadata via `ffmpeg -i`, no ffprobe).
 ipcMain.handle('ffmpegInfo', () => ({
   available: true,
   ffmpeg: ffmpegPath,
-  ffprobe: ffprobePath,
+  ffprobe: null,
   source: 'bundled'
 }));
 

@@ -17,7 +17,7 @@
 - 🎞️ **缩略图胶片条**：底部时间轴铺满抽帧缩略图，定位一目了然
 - ⌨️ **精确输入**：起/止支持 `HH:MM:SS.mmm` 直接输入，与拖拽手柄双向同步
 - 💾 **保存即问**：替换原文件 / 另存为
-- 📦 **内置 ffmpeg**：通过 `ffmpeg-static` / `@ffprobe-installer/ffprobe` 打包，用户无需自己装 ffmpeg
+- 📦 **内置 ffmpeg**：通过 `ffmpeg-static` 打包（仅 ffmpeg，时长/分辨率等元数据用 `ffmpeg -i` 解析，无需单独的 ffprobe），用户无需自己装 ffmpeg
 
 ## 两个版本：Electron 与 Tauri
 
@@ -53,7 +53,7 @@ src-tauri/     ← Rust 命令 + 配置（提供同样的 window.api，经 invok
 
 ```bash
 # Electron 版（需要 Node）
-npm install            # 含 electron 与内置 ffmpeg/ffprobe 二进制
+npm install            # 含 electron 与内置 ffmpeg 二进制
 npm start
 
 # Tauri 版（需要 Rust 工具链 rustc ≥ 1.88；不需要 Node）
@@ -91,7 +91,7 @@ Tauri 版**不打包 ffmpeg**，启动时先找系统 `ffmpeg`/`ffprobe`（PATH 
 
 之后可随时在 **⋯ 菜单 → 设置 ffmpeg…** 重新配置。
 
-ffmpeg / ffprobe 二进制通过 electron-builder 的 `asarUnpack` 解包到 `app.asar.unpacked`，主进程在生产环境自动把路径中的 `app.asar` 替换为 `app.asar.unpacked`。
+ffmpeg 二进制通过 electron-builder 的 `asarUnpack` 解包到 `app.asar.unpacked`，主进程在生产环境自动把路径中的 `app.asar` 替换为 `app.asar.unpacked`。
 
 ## 操作
 
@@ -117,9 +117,9 @@ ffmpeg / ffprobe 二进制通过 electron-builder 的 `asarUnpack` 解包到 `ap
 以下为对外分发时建议补齐的项，本地自用可忽略：
 
 - **应用图标**：在 `build/` 目录放入 `icon.icns`(macOS) / `icon.ico`(Windows) / `icon.png`(Linux)，electron-builder 会自动识别，否则使用默认 Electron 图标。
-- **macOS 签名 / 公证**：未签名的 `.dmg` 会被 Gatekeeper 拦截（内置的 ffmpeg/ffprobe 二进制会被隔离）。如需公开分发，需配置 Apple Developer ID（`build.mac.hardenedRuntime`、entitlements、notarize）。
+- **macOS 签名 / 公证**：未签名的 `.dmg` 会被 Gatekeeper 拦截（内置的 ffmpeg 二进制会被隔离）。如需公开分发，需配置 Apple Developer ID（`build.mac.hardenedRuntime`、entitlements、notarize）。
 - **Windows 签名**：未签名的 `.exe` 会触发 SmartScreen 警告，可选配置代码签名证书。
 
 ## 技术栈
 
-Electron + 原生 HTML/CSS/JS，`ffmpeg-static` / `@ffprobe-installer/ffprobe`，`electron-builder` 打包。
+Electron + 原生 HTML/CSS/JS，`ffmpeg-static`（仅 ffmpeg，元数据用 `ffmpeg -i` 解析），`electron-builder` 打包。
